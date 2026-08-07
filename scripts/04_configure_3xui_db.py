@@ -15,6 +15,9 @@ import json
 import subprocess
 import time
 
+import sys
+import os
+
 def configure_3xui_database():
     db_path = '/etc/x-ui/x-ui.db'
     conn = sqlite3.connect(db_path)
@@ -27,14 +30,19 @@ def configure_3xui_database():
     priv_key = "6DBkzuU5BiTuOPRlDnEXzT79WDNWwsNYL0u5H7r8f24"
     pub_key = "ehNfUkHtzO45nhn9VtDw9iib-KwqZI3n3RM8ZiwCtCE"
 
-    cdn_ext_proxy = [{"dest": "cdn.bds-node.me", "port": 443, "forceTls": "tls"}]
-    direct_ss_ext_proxy = [{"dest": "direct.bds-node.me", "port": 10005}]
-    direct_reality_ext_proxy = [{"dest": "direct.bds-node.me", "port": 8443}]
+    # Domain variables with support for sub1, cdn1, direct1 customization
+    cdn_domain = os.environ.get("CDN_DOMAIN", sys.argv[1] if len(sys.argv) > 1 else "cdn1.bds-node.me")
+    sub_domain = os.environ.get("SUB_DOMAIN", sys.argv[2] if len(sys.argv) > 2 else "sub1.bds-node.me")
+    direct_domain = os.environ.get("DIRECT_DOMAIN", sys.argv[3] if len(sys.argv) > 3 else "direct1.bds-node.me")
+
+    cdn_ext_proxy = [{"dest": cdn_domain, "port": 443, "forceTls": "tls"}]
+    direct_ss_ext_proxy = [{"dest": direct_domain, "port": 10005}]
+    direct_reality_ext_proxy = [{"dest": direct_domain, "port": 8443}]
     sniffing_config = {"enabled": True, "destOverride": ["http", "tls", "quic"], "metadataOnly": False, "routeOnly": False}
 
     # Set subPath to "/" in settings table for native sub URL panel compatibility
     cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('subPath', '/');")
-    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('subURI', 'https://sub.bds-node.me/');")
+    cur.execute(f"INSERT OR REPLACE INTO settings (key, value) VALUES ('subURI', 'https://{sub_domain}/');")
 
     # 1. VLESS WS CDN (Port 10001)
     vless_ws_settings = {
@@ -43,7 +51,7 @@ def configure_3xui_database():
     }
     vless_ws_stream = {
         "network": "ws", "security": "none", "externalProxy": cdn_ext_proxy,
-        "wsSettings": {"acceptProxyProtocol": False, "host": "cdn.bds-node.me", "path": "/vless-ws", "headers": {"Host": "cdn.bds-node.me"}}
+        "wsSettings": {"acceptProxyProtocol": False, "host": cdn_domain, "path": "/vless-ws", "headers": {"Host": cdn_domain}}
     }
     cur.execute("UPDATE inbounds SET settings = ?, stream_settings = ?, sniffing = ?, listen = '127.0.0.1', enable = 1 WHERE port = 10001;",
                 (json.dumps(vless_ws_settings), json.dumps(vless_ws_stream), json.dumps(sniffing_config)))
@@ -54,7 +62,7 @@ def configure_3xui_database():
     }
     vmess_ws_stream = {
         "network": "ws", "security": "none", "externalProxy": cdn_ext_proxy,
-        "wsSettings": {"acceptProxyProtocol": False, "host": "cdn.bds-node.me", "path": "/vmess-ws", "headers": {"Host": "cdn.bds-node.me"}}
+        "wsSettings": {"acceptProxyProtocol": False, "host": cdn_domain, "path": "/vmess-ws", "headers": {"Host": cdn_domain}}
     }
     cur.execute("UPDATE inbounds SET settings = ?, stream_settings = ?, sniffing = ?, listen = '127.0.0.1', enable = 1 WHERE port = 10002;",
                 (json.dumps(vmess_ws_settings), json.dumps(vmess_ws_stream), json.dumps(sniffing_config)))
@@ -65,7 +73,7 @@ def configure_3xui_database():
     }
     trojan_ws_stream = {
         "network": "ws", "security": "none", "externalProxy": cdn_ext_proxy,
-        "wsSettings": {"acceptProxyProtocol": False, "host": "cdn.bds-node.me", "path": "/trojan-ws", "headers": {"Host": "cdn.bds-node.me"}}
+        "wsSettings": {"acceptProxyProtocol": False, "host": cdn_domain, "path": "/trojan-ws", "headers": {"Host": cdn_domain}}
     }
     cur.execute("UPDATE inbounds SET settings = ?, stream_settings = ?, sniffing = ?, listen = '127.0.0.1', enable = 1 WHERE port = 10003;",
                 (json.dumps(trojan_ws_settings), json.dumps(trojan_ws_stream), json.dumps(sniffing_config)))
@@ -77,7 +85,7 @@ def configure_3xui_database():
     }
     ss_ws_stream = {
         "network": "ws", "security": "none", "externalProxy": cdn_ext_proxy,
-        "wsSettings": {"acceptProxyProtocol": False, "host": "cdn.bds-node.me", "path": "/ss-ws", "headers": {"Host": "cdn.bds-node.me"}}
+        "wsSettings": {"acceptProxyProtocol": False, "host": cdn_domain, "path": "/ss-ws", "headers": {"Host": cdn_domain}}
     }
     cur.execute("UPDATE inbounds SET settings = ?, stream_settings = ?, sniffing = ?, listen = '127.0.0.1', enable = 1 WHERE port = 10004;",
                 (json.dumps(ss_ws_settings), json.dumps(ss_ws_stream), json.dumps(sniffing_config)))
