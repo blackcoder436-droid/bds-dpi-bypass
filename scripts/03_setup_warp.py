@@ -1,147 +1,187 @@
 #!/usr/bin/env python3
-"""
-Script 03: Cloudflare WARP Outbound Registrator & Configurator
-Registers a WireGuard WARP account via Cloudflare API and configures Xray WireGuard Outbound in /etc/x-ui/x-ui.db
-"""
+"""Register Cloudflare WARP and update 3x-UI through its HTTP API."""
 
-import urllib.request
-import json
-import sqlite3
-import subprocess
-import time
-import os
+from __future__ import annotations
+
+import argparse
 import base64
+import json
+import os
+import secrets
+import sys
+from datetime import datetime, timezone
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any
 
-def generate_wireguard_keypair():
-    # 1. Try python cryptography module
+
+@dataclass
+class ApiClient:
+    base_url: str
+    username: str
+    password: str
+
+    def __post_init__(self) -> None:
+        self.cookies = ""
+        self.csrf_token = ""
+
+    def request(self, path: str, method: str = "GET", form: dict[str, str] | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = None
+        headers = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
+        if form is not None:
+            from urllib.parse import urlencode
+            body = urlencode(form).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif payload is not None:
+            body = json.dumps(payload).encode()
+            headers["Content-Type"] = "application/json"
+        if self.cookies:
+            headers["Cookie"] = self.cookies
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        req = urllib.request.Request(self.base_url.rstrip("/") + "/" + path.lstrip("/"), data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                cookies = response.headers.get_all("Set-Cookie") or []
+                if cookies:
+                    self.cookies = "; ".join(value.split(";", 1)[0] for value in cookies)
+                result = json.loads(response.read().decode())
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"3x-UI HTTP {exc.code}: {exc.read().decode(errors='replace')[:200]}") from exc
+        if not isinstance(result, dict) or result.get("success") is False:
+            raise RuntimeError(f"3x-UI rejected {path}: {result.get('msg', 'unknown error')}")
+        return result
+
+    def login(self) -> None:
+        token = self.request("csrf-token").get("obj")
+        if isinstance(token, str):
+            self.csrf_token = token
+        self.request("login", "POST", payload={"username": self.username, "password": self.password, "twoFactorCode": ""})
+
+
+def register_warp() -> dict[str, Any]:
     try:
-        from cryptography.hazmat.primitives.asymmetric import x25519
         from cryptography.hazmat.primitives import serialization
-        priv = x25519.X25519PrivateKey.generate()
-        priv_bytes = priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
-        pub_bytes = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        return base64.b64encode(priv_bytes).decode('utf-8'), base64.b64encode(pub_bytes).decode('utf-8')
-    except Exception:
-        pass
-
-    # 2. Try wg CLI if available
+        from cryptography.hazmat.primitives.asymmetric import x25519
+    except ImportError as exc:
+        raise RuntimeError("python3-cryptography is required for WARP key generation") from exc
+    private = x25519.X25519PrivateKey.generate()
+    private_raw = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    public_raw = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    private_key = base64.b64encode(private_raw).decode()
+    public_key = base64.b64encode(public_raw).decode()
+    request = urllib.request.Request(
+        "https://api.cloudflareclient.com/v0a4005/reg",
+        data=json.dumps({"key": public_key, "tos": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), "type": "PC", "model": "bds-dpi-bypass", "name": f"bds-{secrets.token_hex(4)}"}).encode(),
+        headers={"Content-Type": "application/json", "CF-Client-Version": "a-6.30-3596", "User-Agent": "okhttp/3.12.1"},
+        method="POST",
+    )
     try:
-        priv_proc = subprocess.run(['wg', 'genkey'], capture_output=True, text=True, check=True)
-        priv_key = priv_proc.stdout.strip()
-        pub_proc = subprocess.run(['wg', 'pubkey'], input=priv_key, capture_output=True, text=True, check=True)
-        pub_key = pub_proc.stdout.strip()
-        return priv_key, pub_key
-    except Exception:
-        pass
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode())
+            result["_private_key"] = private_key
+            return result
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Cloudflare WARP registration failed: HTTP {exc.code}") from exc
 
-    # 3. Try installing wireguard-tools and running wg
-    try:
-        subprocess.run(['apt-get', 'install', '-y', 'wireguard-tools'], check=True)
-        priv_proc = subprocess.run(['wg', 'genkey'], capture_output=True, text=True, check=True)
-        priv_key = priv_proc.stdout.strip()
-        pub_proc = subprocess.run(['wg', 'pubkey'], input=priv_key, capture_output=True, text=True, check=True)
-        pub_key = pub_proc.stdout.strip()
-        return priv_key, pub_key
-    except Exception as e:
-        raise RuntimeError(f"Failed to generate WireGuard keypair: {e}")
 
-def register_warp_account(pub_key):
-    url = "https://api.cloudflareclient.com/v0a2158/reg"
-    headers = {
-        "User-Agent": "okhttp/3.12.1",
-        "Content-Type": "application/json; charset=UTF-8"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--panel-url", required=True)
+    parser.add_argument("--username", default=os.environ.get("XUI_USERNAME"))
+    parser.add_argument("--password", default=os.environ.get("XUI_PASSWORD"))
+    return parser.parse_args()
+
+
+def warp_inbound_tags(api: ApiClient) -> list[str]:
+    """Return the runtime tags for BDS's four Cloudflare/CDN inbounds.
+
+    3x-UI 3.6 generates tags such as ``in-10001-tcp``.  They must be read
+    from the panel instead of guessed: a stale tag silently bypasses WARP and
+    exposes the VPS as the user's egress IP.
+    """
+    result = api.request("panel/api/inbounds/list")
+    inbounds = result.get("obj") or []
+    if not isinstance(inbounds, list):
+        raise RuntimeError("3x-UI returned an invalid inbound list")
+    tags_by_port = {
+        int(item["port"]): str(item["tag"])
+        for item in inbounds
+        if isinstance(item, dict)
+        and item.get("port") is not None
+        and item.get("tag")
     }
-    payload = {
-        "key": pub_key,
-        "install_id": "",
-        "fcm_token": "",
-        "tos": "2024-01-01T00:00:00.000Z",
-        "model": "PC",
-        "serial_number": "1",
-        "locale": "en_US"
-    }
-    data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req) as response:
-        res_data = json.loads(response.read().decode('utf-8'))
-        return res_data
+    required_ports = (10001, 10002, 10003, 10004)
+    missing = [str(port) for port in required_ports if port not in tags_by_port]
+    if missing:
+        raise RuntimeError(f"Missing CDN inbound tag(s) for port(s): {', '.join(missing)}")
+    return [tags_by_port[port] for port in required_ports]
 
-def update_xui_warp_config():
-    print("=== Registering Cloudflare WARP Account ===")
-    my_priv_key, my_pub_key = generate_wireguard_keypair()
-    warp_data = register_warp_account(my_pub_key)
-    
-    account_id = warp_data['id']
-    priv_key = my_priv_key
-    pub_key = warp_data['config']['peers'][0]['public_key']
-    endpoint_addr = warp_data['config']['peers'][0]['endpoint']['host']
-    v4_addr = warp_data['config']['interface']['addresses']['v4']
-    v6_addr = warp_data['config']['interface']['addresses']['v6']
-    reserved = warp_data['config']['client_id']
 
-    db_path = '/etc/x-ui/x-ui.db'
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
+def main() -> int:
+    args = parse_args()
+    if not args.username or not args.password:
+        raise RuntimeError("XUI_USERNAME and XUI_PASSWORD must be provided through the environment or arguments")
+    api = ApiClient(args.panel_url, args.username, args.password)
+    api.login()
+    inbound_tags = warp_inbound_tags(api)
+    xray_response = api.request("panel/api/xray/", "POST")
+    obj = xray_response.get("obj") or {}
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("3x-UI returned an invalid Xray template wrapper") from exc
+    raw_template = obj.get("xraySetting") if isinstance(obj, dict) else None
+    if isinstance(raw_template, str):
+        template = json.loads(raw_template)
+    elif isinstance(raw_template, dict):
+        template = raw_template
+    else:
+        raise RuntimeError("3x-UI did not return an Xray template")
 
-    cur.execute("SELECT value FROM settings WHERE key = 'xrayTemplateConfig';")
-    row = cur.fetchone()
-    if not row:
-        print("❌ Error: xrayTemplateConfig not found in settings!")
-        return
-
-    tpl = json.loads(row[0])
-
-    warp_outbound = {
-        "protocol": "wireguard",
-        "settings": {
-            "secretKey": priv_key,
-            "address": [v4_addr + "/32", v6_addr + "/128"],
-            "peers": [
-                {
-                    "publicKey": pub_key,
-                    "endpoint": endpoint_addr,
-                    "allowedIPs": ["0.0.0.0/0", "::/0"]
-                }
-            ],
-            "reserved": list(base64_to_reserved(reserved)),
-            "mtu": 1280
-        },
-        "tag": "warp"
-    }
-
-    # Update outbounds in template
-    outbounds = [o for o in tpl.get("outbounds", []) if o.get("tag") != "warp"]
-    outbounds.append(warp_outbound)
-    tpl["outbounds"] = outbounds
-
-    # Update routing rules to direct CDN inbounds to warp
-    routing_rules = tpl.get("routing", {}).get("rules", [])
-    warp_rule_exists = False
-    for rule in routing_rules:
-        if rule.get("outboundTag") == "warp":
-            rule["inboundTag"] = ["inbound-10001", "inbound-10002", "inbound-10003", "inbound-10004"]
-            warp_rule_exists = True
-            break
-            
-    if not warp_rule_exists:
-        routing_rules.append({
-            "type": "field",
-            "inboundTag": ["inbound-10001", "inbound-10002", "inbound-10003", "inbound-10004"],
-            "outboundTag": "warp"
+    current_outbounds = template.get("outbounds", [])
+    existing_warp = next((entry for entry in current_outbounds if entry.get("tag") == "warp"), None)
+    outbounds = [entry for entry in current_outbounds if entry.get("tag") != "warp"]
+    if existing_warp:
+        outbounds.append(existing_warp)
+    else:
+        warp = register_warp()
+        config = warp.get("config") or {}
+        peer = (config.get("peers") or [{}])[0]
+        private_key = str(warp.get("_private_key", ""))
+        public_key = str(peer.get("public_key", ""))
+        endpoint = str((peer.get("endpoint") or {}).get("host", ""))
+        addresses = config.get("interface", {}).get("addresses", {})
+        client_id = str(config.get("client_id", ""))
+        if not all([private_key, public_key, endpoint, addresses.get("v4"), client_id]):
+            raise RuntimeError("Cloudflare WARP returned an incomplete configuration")
+        reserved = list(base64.b64decode(client_id))
+        outbounds.append({
+            "protocol": "wireguard",
+            "tag": "warp",
+            "settings": {
+                "secretKey": private_key,
+                "address": [f"{addresses['v4']}/32"] + ([f"{addresses['v6']}/128"] if addresses.get("v6") else []),
+                "peers": [{"publicKey": public_key, "endpoint": endpoint, "allowedIPs": ["0.0.0.0/0", "::/0"]}],
+                "reserved": reserved,
+                "mtu": 1280,
+            },
         })
-    tpl["routing"]["rules"] = routing_rules
+    routing = template.setdefault("routing", {})
+    rules = [rule for rule in routing.get("rules", []) if rule.get("outboundTag") != "warp"]
+    rules.append({"type": "field", "inboundTag": inbound_tags, "outboundTag": "warp"})
+    routing["rules"] = rules
+    template["outbounds"] = outbounds
+    api.request("panel/api/xray/update", "POST", form={"xraySetting": json.dumps(template, separators=(",", ":")), "outboundTestUrl": "https://www.google.com/generate_204"})
+    print("Cloudflare WARP outbound configured through the 3x-UI API.")
+    return 0
 
-    cur.execute("UPDATE settings SET value = ? WHERE key = 'xrayTemplateConfig';", (json.dumps(tpl, indent=2),))
-    conn.commit()
-    conn.close()
-    
-    print("✓ Successfully updated Cloudflare WARP Outbound in 3x-ui Database!")
-    subprocess.run(['systemctl', 'restart', 'x-ui'])
 
-def base64_to_reserved(res_str):
-    import base64
-    raw = base64.b64decode(res_str)
-    return [int(b) for b in raw]
-
-if __name__ == '__main__':
-    update_xui_warp_config()
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

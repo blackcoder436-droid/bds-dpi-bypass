@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Script 01: Enable TCP BBR Congestion Control
-# Reduces packet loss & optimizes throughput for mobile ISP connections
-# ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
-echo "=== [1/4] Enabling Linux BBR Congestion Control ==="
+SYSCTL_FILE="/etc/sysctl.d/99-bds-dpi-bbr.conf"
 
-# Check sysctl BBR status
-if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
-    echo "✓ TCP BBR is already enabled!"
-else
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p
-    echo "✓ Successfully enabled TCP BBR!"
+if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == "bbr" ]]; then
+    echo "TCP BBR is already enabled."
+    exit 0
 fi
+
+cat > "${SYSCTL_FILE}" <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+sysctl --system >/dev/null
+[[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] || {
+    echo "Failed to enable TCP BBR." >&2
+    exit 1
+}
+
+echo "TCP BBR enabled."
