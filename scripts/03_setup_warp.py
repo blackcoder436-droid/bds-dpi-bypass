@@ -281,7 +281,7 @@ def main() -> int:
     template = load_xray_template(api)
     if args.verify_only:
         verify_installed_warp(api, template, inbound_tags)
-        print("Cloudflare WARP real outbound and all four CDN routes verified.")
+        print(f"Cloudflare WARP real outbound and {len(inbound_tags)} selected CDN route(s) verified.")
         return 0
 
     warp = select_working_warp(api, template)
