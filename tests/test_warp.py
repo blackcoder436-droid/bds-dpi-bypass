@@ -43,6 +43,11 @@ class FakeApi:
 
 
 class WarpProvisioningTests(unittest.TestCase):
+    def test_backup_profile_accepts_only_vless_cdn_port(self) -> None:
+        api = mock.MagicMock()
+        api.request.return_value = {"obj": [{"port": 10001, "tag": "inbound-10001"}]}
+        self.assertEqual(warp.warp_inbound_tags(api, (10001,)), ["inbound-10001"])
+
     def test_panel_public_prefix_is_preserved_for_authenticated_routes(self) -> None:
         deploy = (ROOT / "deploy.sh").read_text(encoding="utf-8")
         nginx = (ROOT / "config" / "nginx" / "bds-node.conf").read_text(encoding="utf-8")

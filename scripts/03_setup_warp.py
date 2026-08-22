@@ -97,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panel-url", required=True)
     parser.add_argument("--username", default=os.environ.get("XUI_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("XUI_PASSWORD"))
+    parser.add_argument("--required-ports", default="10001,10002,10003,10004")
     parser.add_argument("--verify-only", action="store_true")
     return parser.parse_args()
 
@@ -119,8 +120,8 @@ def load_xray_template(api: ApiClient) -> dict[str, Any]:
     return parse_json_object(wrapper.get("xraySetting"), "3x-UI did not return an Xray template")
 
 
-def warp_inbound_tags(api: ApiClient) -> list[str]:
-    """Return 3x-UI's runtime tags for the four BDS CDN inbounds."""
+def warp_inbound_tags(api: ApiClient, required_ports: tuple[int, ...] = (10001, 10002, 10003, 10004)) -> list[str]:
+    """Return 3x-UI runtime tags for the selected BDS CDN inbounds."""
     inbounds = api.request("panel/api/inbounds/list").get("obj") or []
     if not isinstance(inbounds, list):
         raise RuntimeError("3x-UI returned an invalid inbound list")
@@ -129,7 +130,6 @@ def warp_inbound_tags(api: ApiClient) -> list[str]:
         for item in inbounds
         if isinstance(item, dict) and item.get("port") is not None and item.get("tag")
     }
-    required_ports = (10001, 10002, 10003, 10004)
     missing = [str(port) for port in required_ports if port not in tags_by_port]
     if missing:
         raise RuntimeError(f"Missing CDN inbound tag(s) for port(s): {', '.join(missing)}")
@@ -274,7 +274,10 @@ def main() -> int:
         raise RuntimeError("XUI_USERNAME and XUI_PASSWORD must be provided through the environment or arguments")
     api = ApiClient(args.panel_url, args.username, args.password)
     api.login()
-    inbound_tags = warp_inbound_tags(api)
+    required_ports = tuple(int(value.strip()) for value in getattr(args, "required_ports", "10001,10002,10003,10004").split(",") if value.strip())
+    if not required_ports:
+        raise RuntimeError("At least one WARP-routed inbound port is required")
+    inbound_tags = warp_inbound_tags(api, required_ports)
     template = load_xray_template(api)
     if args.verify_only:
         verify_installed_warp(api, template, inbound_tags)

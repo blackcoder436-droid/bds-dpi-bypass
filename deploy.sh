@@ -186,7 +186,9 @@ ensure_postgres_backend() {
     umask 077
     {
         printf 'XUI_DB_TYPE=postgres\n'
-        printf 'XUI_DB_DSN=%q\n' "${pg_dsn}"
+        # systemd EnvironmentFile does not apply Bash's %q unescaping. Writing
+        # an escaped question mark makes PostgreSQL interpret the DB as `xui\\`.
+        printf 'XUI_DB_DSN=%s\n' "${pg_dsn}"
     } > "${env_file}"
     chmod 600 "${env_file}"
     umask 022
@@ -271,10 +273,11 @@ configure_3xui() {
         --deployment-profile "${DEPLOYMENT_PROFILE}" \
         --profiles-file "${SUB_PROFILE_FILE}"
 
-    if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
-        python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
-            --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}"
-    fi
+    local warp_ports="10001,10002,10003,10004"
+    [[ "${DEPLOYMENT_PROFILE}" == "full" ]] || warp_ports="10001"
+    python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
+        --required-ports "${warp_ports}"
 }
 
 install_operator_tools() {
@@ -323,11 +326,12 @@ verify() {
         --check-url-base "http://127.0.0.1:${XUI_SUB_PORT}/${XUI_SUB_PATH}" \
         --host-header "${SUB_DOMAIN}" \
         --expected-profile "${DEPLOYMENT_PROFILE}"
-    if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
-        python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
-            --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
-            --verify-only
-    fi
+    local warp_ports="10001,10002,10003,10004"
+    [[ "${DEPLOYMENT_PROFILE}" == "full" ]] || warp_ports="10001"
+    python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
+        --required-ports "${warp_ports}" \
+        --verify-only
     log "All local smoke tests passed."
 }
 
