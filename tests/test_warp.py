@@ -43,13 +43,13 @@ class FakeApi:
 
 
 class WarpProvisioningTests(unittest.TestCase):
-    def test_panel_public_prefix_is_stripped_to_internal_root(self) -> None:
+    def test_panel_public_prefix_is_preserved_for_authenticated_routes(self) -> None:
         deploy = (ROOT / "deploy.sh").read_text(encoding="utf-8")
         nginx = (ROOT / "config" / "nginx" / "bds-node.conf").read_text(encoding="utf-8")
         self.assertIn('-webBasePath "/"', deploy)
         self.assertIn('--panel-url "http://127.0.0.1:${XUI_PANEL_PORT}"', deploy)
         self.assertIn('location /{{XUI_WEB_BASE_PATH}}/', nginx)
-        self.assertIn('proxy_pass http://127.0.0.1:{{XUI_PANEL_PORT}}/;', nginx)
+        self.assertIn('proxy_pass http://127.0.0.1:{{XUI_PANEL_PORT}};', nginx)
 
     def test_endpoint_with_port_is_not_duplicated(self) -> None:
         candidates = warp.endpoint_candidates("162.159.192.1:2408")
