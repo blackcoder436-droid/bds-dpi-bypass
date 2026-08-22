@@ -249,6 +249,17 @@ class SubscriptionProfileTests(unittest.TestCase):
                     "http://127.0.0.1:2096/sub",
                 )
 
+    def test_backup_subscription_requires_exactly_one_vless_profile(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = base64.b64encode(b"vless://cdn\n")
+        with mock.patch.object(show.urllib.request, "urlopen", return_value=response):
+            count, schemes = show.check_profile(
+                {"sub_id": "client-subscription-id"},
+                "http://127.0.0.1:2096/sub",
+                expected_profile="cdn_vless_backup",
+            )
+        self.assertEqual((count, schemes), (1, ["vless"]))
+
     def test_subscription_decoder_accepts_base64(self) -> None:
         raw = "vless://one\nvmess://two\ntrojan://three\n".encode()
         encoded = base64.b64encode(raw)

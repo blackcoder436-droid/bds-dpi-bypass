@@ -108,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reality-dest", default="www.google.com:443")
     parser.add_argument("--reality-server-name", default="www.google.com")
     parser.add_argument("--server-label", default=os.environ.get("SERVER_LABEL", "SG1"))
+    parser.add_argument("--deployment-profile", choices=("full", "cdn_vless_backup"), default="full")
     parser.add_argument("--profiles-file", default="/etc/bds-dpi-bypass/subscription-profiles.json")
     parser.add_argument("--dry-run", action="store_true", help="Validate the unified profile without changing panel state")
     return parser.parse_args()
@@ -311,7 +312,7 @@ def build_specs(args: argparse.Namespace, profiles: dict[str, ProfileValues], pr
     client = profiles["client"]
     common = {"email": client.email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True, "tgId": 0, "subId": client.sub_id, "reset": 0}
     ws = lambda path: {"network": "ws", "security": "none", "externalProxy": cdn_proxy, "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": path, "headers": {"Host": args.cdn_domain}}}
-    return [
+    specs = [
         {"profile": "client", "subSortIndex": 10, "protocol": "vless", "port": 10001, "remark": f"{args.server_label} - VLESS WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": args.cdn_domain, "settings": {"clients": [{**common, "id": client.client_id}], "decryption": "none", "fallbacks": []}, "streamSettings": ws("/vless-ws")},
         {"profile": "client", "subSortIndex": 20, "protocol": "vmess", "port": 10002, "remark": f"{args.server_label} - VMess WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": args.cdn_domain, "settings": {"clients": [{**common, "id": client.client_id, "alterId": 0, "security": "aes-128-gcm"}]}, "streamSettings": ws("/vmess-ws")},
         {"profile": "client", "subSortIndex": 30, "protocol": "trojan", "port": 10003, "remark": f"{args.server_label} - Trojan WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": args.cdn_domain, "settings": {"clients": [{**common, "password": client.password}]}, "streamSettings": ws("/trojan-ws")},
@@ -319,6 +320,7 @@ def build_specs(args: argparse.Namespace, profiles: dict[str, ProfileValues], pr
         {"profile": "client", "subSortIndex": 50, "protocol": "shadowsocks", "port": 10005, "remark": f"{args.server_label} - Shadowsocks Direct", "listen": "0.0.0.0", "shareAddrStrategy": "custom", "shareAddr": args.direct_domain, "settings": {"method": "chacha20-ietf-poly1305", "password": client.password, "network": "tcp,udp", "ivCheck": False, "clients": [{**common, "method": "chacha20-ietf-poly1305", "password": client.password}]}, "streamSettings": {"network": "tcp", "security": "none", "externalProxy": direct_ss_proxy, "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}}},
         {"profile": "client", "subSortIndex": 60, "protocol": "vless", "port": 8443, "remark": f"{args.server_label} - VLESS Reality Direct", "listen": "0.0.0.0", "shareAddrStrategy": "custom", "shareAddr": args.direct_domain, "settings": {"clients": [{**common, "id": client.client_id, "flow": "xtls-rprx-vision"}], "decryption": "none", "fallbacks": []}, "streamSettings": {"network": "tcp", "security": "reality", "externalProxy": direct_reality_proxy, "realitySettings": {"show": False, "xver": 0, "dest": args.reality_dest, "serverNames": [args.reality_server_name], "privateKey": private_key, "settings": {"publicKey": public_key, "fingerprint": "chrome", "spiderX": "/"}, "minClientVer": "", "maxClientVer": "", "maxTimeDiff": 0, "shortIds": short_ids}, "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}}},
     ]
+    return specs[:1] if getattr(args, "deployment_profile", "full") == "cdn_vless_backup" else specs
 
 
 def configure_settings(api: ApiClient, args: argparse.Namespace) -> None:
@@ -336,6 +338,13 @@ def configure_settings(api: ApiClient, args: argparse.Namespace) -> None:
         "subCertFile": "",
         "subKeyFile": "",
     })
+    if getattr(args, "deployment_profile", "full") == "cdn_vless_backup":
+        template = json_field(current.get("xrayTemplateConfig"), {})
+        policy = template.setdefault("policy", {})
+        levels = policy.setdefault("levels", {})
+        level_zero = levels.setdefault("0", {})
+        level_zero.update({"handshake": 4, "connIdle": 90, "uplinkOnly": 2, "downlinkOnly": 5, "bufferSize": 64})
+        current["xrayTemplateConfig"] = json.dumps(template, separators=(",", ":"))
     api.request("panel/api/setting/update", "POST", current)
 
 

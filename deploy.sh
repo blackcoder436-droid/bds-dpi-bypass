@@ -44,11 +44,13 @@ load_config() {
     REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.google.com}"
     ENABLE_BBR="${ENABLE_BBR:-true}"
     ENABLE_UFW="${ENABLE_UFW:-false}"
+    DEPLOYMENT_PROFILE="${DEPLOYMENT_PROFILE:-full}"
 
     export SERVER_LABEL PANEL_DOMAIN SUB_DOMAIN CDN_DOMAIN DIRECT_DOMAIN
     export XUI_PANEL_PORT XUI_SUB_PORT XUI_WEB_BASE_PATH XUI_SUB_PATH
     export SUB_PROFILE_FILE
     export TLS_CERT_FILE TLS_KEY_FILE REALITY_DEST REALITY_SERVER_NAME
+    export DEPLOYMENT_PROFILE
 }
 
 validate_config() {
@@ -70,6 +72,8 @@ validate_config() {
     [[ "${XUI_SUB_PATH}" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "XUI_SUB_PATH must be 1-64 safe characters."
     [[ "${SUB_PROFILE_FILE}" == /* ]] || die "SUB_PROFILE_FILE must be an absolute path."
     [[ "${REALITY_DEST}" =~ ^[^[:space:]:]+:[0-9]+$ ]] || die "REALITY_DEST must look like host:port."
+    [[ "${DEPLOYMENT_PROFILE}" == "full" || "${DEPLOYMENT_PROFILE}" == "cdn_vless_backup" ]] \
+        || die "DEPLOYMENT_PROFILE must be full or cdn_vless_backup."
 }
 
 preflight() {
@@ -264,10 +268,13 @@ configure_3xui() {
         --direct-domain "${DIRECT_DOMAIN}" \
         --reality-dest "${REALITY_DEST}" \
         --reality-server-name "${REALITY_SERVER_NAME}" \
+        --deployment-profile "${DEPLOYMENT_PROFILE}" \
         --profiles-file "${SUB_PROFILE_FILE}"
 
-    python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
-        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}"
+    if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
+        python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
+            --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}"
+    fi
 }
 
 install_operator_tools() {
@@ -286,9 +293,11 @@ configure_network() {
         ufw allow OpenSSH
         ufw allow 80/tcp
         ufw allow 443/tcp
-        ufw allow 10005/tcp
-        ufw allow 10005/udp
-        ufw allow 8443/tcp
+        if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
+            ufw allow 10005/tcp
+            ufw allow 10005/udp
+            ufw allow 8443/tcp
+        fi
         ufw --force enable
     fi
 }
@@ -304,15 +313,21 @@ verify() {
     curl --fail --silent --show-error --max-time 10 \
         --resolve "${CDN_DOMAIN}:443:127.0.0.1" \
         "https://${CDN_DOMAIN}/healthz" --insecure | grep -qx 'OK'
-    ss -lnt | grep -Eq ":10005[[:space:]]" || die "Direct Shadowsocks port 10005 is not listening."
-    ss -lnt | grep -Eq ":8443[[:space:]]" || die "Reality port 8443 is not listening."
+    ss -lnt | grep -Eq ":10001[[:space:]]" || die "VLESS CDN port 10001 is not listening."
+    if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
+        ss -lnt | grep -Eq ":10005[[:space:]]" || die "Direct Shadowsocks port 10005 is not listening."
+        ss -lnt | grep -Eq ":8443[[:space:]]" || die "Reality port 8443 is not listening."
+    fi
     python3 "${SCRIPT_DIR}/scripts/05_show_subscriptions.py" \
         --profiles-file "${SUB_PROFILE_FILE}" \
         --check-url-base "http://127.0.0.1:${XUI_SUB_PORT}/${XUI_SUB_PATH}" \
-        --host-header "${SUB_DOMAIN}"
-    python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
-        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
-        --verify-only
+        --host-header "${SUB_DOMAIN}" \
+        --expected-profile "${DEPLOYMENT_PROFILE}"
+    if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
+        python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
+            --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
+            --verify-only
+    fi
     log "All local smoke tests passed."
 }
 

@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
         help="Verify the client subscription against this internal base URL without printing its token.",
     )
     parser.add_argument("--host-header", help="Host header to use for an internal subscription check.")
+    parser.add_argument("--expected-profile", choices=("full", "cdn_vless_backup"), default="full")
     return parser.parse_args()
 
 
@@ -65,7 +66,7 @@ def link_scheme(link: str) -> str:
     return link.split("://", 1)[0].lower()
 
 
-def check_profile(profile: dict[str, Any], base_url: str, host_header: str | None = None) -> tuple[int, list[str]]:
+def check_profile(profile: dict[str, Any], base_url: str, host_header: str | None = None, expected_profile: str = "full") -> tuple[int, list[str]]:
     sub_id = str(profile["sub_id"]).strip()
     headers = {"User-Agent": "HiddifyNext/2.0"}
     if host_header:
@@ -77,6 +78,10 @@ def check_profile(profile: dict[str, Any], base_url: str, host_header: str | Non
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Client subscription request failed: {exc.reason}") from exc
     schemes = [link_scheme(link) for link in links]
+    if expected_profile == "cdn_vless_backup":
+        if len(links) != 1 or schemes != ["vless"]:
+            raise RuntimeError("Backup subscription must contain exactly one VLESS profile")
+        return len(links), schemes
     if len(links) < 6:
         raise RuntimeError("Client subscription returned fewer than six profiles")
     required_counts = {"vless": 2, "ss": 2, "vmess": 1, "trojan": 1}
@@ -95,7 +100,7 @@ def main() -> int:
     profiles_path = Path(args.profiles_file)
     profiles = load_profiles(profiles_path)
     if args.check_url_base:
-        count, schemes = check_profile(profiles["client"], args.check_url_base, args.host_header)
+        count, schemes = check_profile(profiles["client"], args.check_url_base, args.host_header, args.expected_profile)
         print(f"Client subscription verified: {count} profiles ({', '.join(schemes)})")
         return 0
 
