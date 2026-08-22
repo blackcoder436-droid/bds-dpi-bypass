@@ -413,7 +413,7 @@ def main() -> int:
         by_port = {int(item.get("port")): item for item in existing if isinstance(item, dict) and item.get("port") is not None}
         for spec in specs:
             merge_managed_clients(by_port.get(spec["port"]), spec, profiles)
-        print(f"Dry run passed: unified {args.server_label} client will cover all six inbounds; unrelated clients are preserved.")
+        print(f"Dry run passed: unified {args.server_label} client will cover {len(specs)} managed inbound(s); unrelated clients are preserved.")
         return 0
     configure_settings(api, args)
     key_result = (api.request("panel/api/server/getNewX25519Cert").get("obj") or {}) if current_key is None else {}
@@ -422,9 +422,10 @@ def main() -> int:
     short_ids = current_key[2] if current_key else [secrets.token_hex(4)]
     if not private_key or not public_key:
         raise RuntimeError("3x-UI did not return a complete X25519 key pair")
-    configure_inbounds(api, existing, build_specs(args, profiles, private_key, public_key, short_ids), profiles)
+    specs = build_specs(args, profiles, private_key, public_key, short_ids)
+    configure_inbounds(api, existing, specs, profiles)
     save_profiles(profiles_file, profiles, f"https://{args.sub_domain}/{args.sub_path.strip('/')}/", args.server_label)
-    print(f"Configured one unified {args.server_label} client across six BDS inbounds. Profile: {profiles_file}")
+    print(f"Configured one unified {args.server_label} client across {len(specs)} managed inbound(s). Profile: {profiles_file}")
     return 0
 
 
