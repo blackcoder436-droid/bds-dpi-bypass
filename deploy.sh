@@ -208,11 +208,11 @@ configure_panel_runtime() {
         -username "${panel_username}" \
         -password "${panel_password}" \
         -port "${XUI_PANEL_PORT}" \
-        -webBasePath "${XUI_WEB_BASE_PATH}"
+        -webBasePath "/"
     systemctl restart x-ui
     for _ in $(seq 1 30); do
         curl --silent --max-time 2 \
-            "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}/login" >/dev/null 2>&1 && return
+            "http://127.0.0.1:${XUI_PANEL_PORT}/login" >/dev/null 2>&1 && return
         sleep 1
     done
     die "3x-UI did not become ready after panel configuration."
@@ -246,7 +246,7 @@ install_3xui() {
     XUI_SSL_MODE=none \
     XUI_DB_TYPE=postgres \
     XUI_PANEL_PORT="${XUI_PANEL_PORT}" \
-    XUI_WEB_BASE_PATH="${XUI_WEB_BASE_PATH}" \
+    XUI_WEB_BASE_PATH="/" \
     XUI_USERNAME="${XUI_USERNAME}" \
     XUI_PASSWORD="${XUI_PASSWORD}" \
     bash "${install_script}" "${XUI_VERSION}"
@@ -255,7 +255,7 @@ install_3xui() {
 
 configure_3xui() {
     python3 "${SCRIPT_DIR}/scripts/04_configure_3xui_db.py" \
-        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}" \
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
         --server-label "${SERVER_LABEL}" \
         --sub-domain "${SUB_DOMAIN}" \
         --sub-port "${XUI_SUB_PORT}" \
@@ -267,11 +267,12 @@ configure_3xui() {
         --profiles-file "${SUB_PROFILE_FILE}"
 
     python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
-        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}"
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}"
 }
 
 install_operator_tools() {
     install -m 755 "${SCRIPT_DIR}/scripts/05_show_subscriptions.py" /usr/local/sbin/bds-dpi-show-subscriptions
+    install -m 755 "${SCRIPT_DIR}/scripts/03_setup_warp.py" /usr/local/sbin/bds-dpi-verify-warp
 }
 
 configure_network() {
@@ -299,7 +300,7 @@ verify() {
     grep -q '^XUI_DB_TYPE=postgres$' /etc/default/x-ui || die "3x-UI is not configured for PostgreSQL."
     sudo -u postgres psql -d xui -tAc 'SELECT 1' | grep -qx '1' || die "PostgreSQL xui database check failed."
     curl --fail --silent --show-error --max-time 10 \
-        "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}/" >/dev/null
+        "http://127.0.0.1:${XUI_PANEL_PORT}/" >/dev/null
     curl --fail --silent --show-error --max-time 10 \
         --resolve "${CDN_DOMAIN}:443:127.0.0.1" \
         "https://${CDN_DOMAIN}/healthz" --insecure | grep -qx 'OK'
@@ -309,6 +310,9 @@ verify() {
         --profiles-file "${SUB_PROFILE_FILE}" \
         --check-url-base "http://127.0.0.1:${XUI_SUB_PORT}/${XUI_SUB_PATH}" \
         --host-header "${SUB_DOMAIN}"
+    python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
+        --verify-only
     log "All local smoke tests passed."
 }
 

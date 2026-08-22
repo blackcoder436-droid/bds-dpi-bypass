@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Register Cloudflare WARP and update 3x-UI through its HTTP API."""
+"""Install and verify a Cloudflare WARP outbound through the 3x-UI API."""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import ipaddress
 import json
 import os
+import re
 import secrets
 import sys
 from datetime import datetime, timezone
@@ -14,6 +16,10 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+
+
+WARP_TEST_URL = "https://www.google.com/generate_204"
+WARP_PORTS = (500, 1701, 4500, 2408)
 
 
 @dataclass
@@ -42,7 +48,7 @@ class ApiClient:
             headers["X-CSRF-Token"] = self.csrf_token
         req = urllib.request.Request(self.base_url.rstrip("/") + "/" + path.lstrip("/"), data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=20) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 cookies = response.headers.get_all("Set-Cookie") or []
                 if cookies:
                     self.cookies = "; ".join(value.split(";", 1)[0] for value in cookies)
@@ -78,7 +84,7 @@ def register_warp() -> dict[str, Any]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             result = json.loads(response.read().decode())
             result["_private_key"] = private_key
             return result
@@ -91,32 +97,175 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panel-url", required=True)
     parser.add_argument("--username", default=os.environ.get("XUI_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("XUI_PASSWORD"))
+    parser.add_argument("--verify-only", action="store_true")
     return parser.parse_args()
 
 
-def warp_inbound_tags(api: ApiClient) -> list[str]:
-    """Return the runtime tags for BDS's four Cloudflare/CDN inbounds.
+def parse_json_object(value: Any, error: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(error) from exc
+        if isinstance(parsed, dict):
+            return parsed
+    raise RuntimeError(error)
 
-    3x-UI 3.6 generates tags such as ``in-10001-tcp``.  They must be read
-    from the panel instead of guessed: a stale tag silently bypasses WARP and
-    exposes the VPS as the user's egress IP.
-    """
-    result = api.request("panel/api/inbounds/list")
-    inbounds = result.get("obj") or []
+
+def load_xray_template(api: ApiClient) -> dict[str, Any]:
+    wrapper = parse_json_object(api.request("panel/api/xray/", "POST").get("obj") or {}, "3x-UI returned an invalid Xray template wrapper")
+    return parse_json_object(wrapper.get("xraySetting"), "3x-UI did not return an Xray template")
+
+
+def warp_inbound_tags(api: ApiClient) -> list[str]:
+    """Return 3x-UI's runtime tags for the four BDS CDN inbounds."""
+    inbounds = api.request("panel/api/inbounds/list").get("obj") or []
     if not isinstance(inbounds, list):
         raise RuntimeError("3x-UI returned an invalid inbound list")
     tags_by_port = {
         int(item["port"]): str(item["tag"])
         for item in inbounds
-        if isinstance(item, dict)
-        and item.get("port") is not None
-        and item.get("tag")
+        if isinstance(item, dict) and item.get("port") is not None and item.get("tag")
     }
     required_ports = (10001, 10002, 10003, 10004)
     missing = [str(port) for port in required_ports if port not in tags_by_port]
     if missing:
         raise RuntimeError(f"Missing CDN inbound tag(s) for port(s): {', '.join(missing)}")
     return [tags_by_port[port] for port in required_ports]
+
+
+def normalize_address(address: str, prefix: int) -> str:
+    raw = str(address).strip()
+    if not raw:
+        return ""
+    try:
+        return str(ipaddress.ip_interface(raw if "/" in raw else f"{raw}/{prefix}"))
+    except ValueError as exc:
+        raise RuntimeError("Cloudflare WARP returned an invalid interface address") from exc
+
+
+def endpoint_host_and_port(endpoint: str) -> tuple[str, int | None]:
+    raw = str(endpoint).strip()
+    if not raw:
+        raise RuntimeError("Cloudflare WARP returned an empty endpoint")
+    if raw.startswith("["):
+        match = re.fullmatch(r"\[([^]]+)](?::(\d+))?", raw)
+        if not match:
+            raise RuntimeError("Cloudflare WARP returned an invalid endpoint")
+        return match.group(1), int(match.group(2)) if match.group(2) else None
+    if raw.count(":") == 1 and raw.rsplit(":", 1)[1].isdigit():
+        host, port = raw.rsplit(":", 1)
+        return host, int(port)
+    return raw, None
+
+
+def endpoint_candidates(endpoint: str) -> list[str]:
+    host, offered_port = endpoint_host_and_port(endpoint)
+    ports = []
+    if offered_port:
+        ports.append(offered_port)
+    ports.extend(port for port in WARP_PORTS if port not in ports)
+    rendered_host = f"[{host}]" if ":" in host else host
+    return [f"{rendered_host}:{port}" for port in ports]
+
+
+def build_warp_candidates(registration: dict[str, Any]) -> list[dict[str, Any]]:
+    config = registration.get("config") or {}
+    peer = (config.get("peers") or [{}])[0]
+    endpoint_data = peer.get("endpoint") or {}
+    endpoint = str(endpoint_data.get("v4") or endpoint_data.get("host") or "")
+    addresses = config.get("interface", {}).get("addresses", {})
+    private_key = str(registration.get("_private_key", ""))
+    public_key = str(peer.get("public_key", ""))
+    client_id = str(config.get("client_id", ""))
+    try:
+        reserved = list(base64.b64decode(client_id, validate=True))
+    except (ValueError, base64.binascii.Error) as exc:
+        raise RuntimeError("Cloudflare WARP returned an invalid client id") from exc
+    address = [normalize_address(str(addresses.get("v4", "")), 32)]
+    if addresses.get("v6"):
+        address.append(normalize_address(str(addresses["v6"]), 128))
+    if not all([private_key, public_key, endpoint, address[0]]) or len(reserved) != 3:
+        raise RuntimeError("Cloudflare WARP returned an incomplete configuration")
+    return [
+        {
+            "protocol": "wireguard",
+            "tag": "warp",
+            "settings": {
+                "secretKey": private_key,
+                "address": address,
+                "peers": [{"publicKey": public_key, "endpoint": candidate, "allowedIPs": ["0.0.0.0/0", "::/0"]}],
+                "reserved": reserved,
+                "mtu": 1280,
+                "domainStrategy": "ForceIPv4",
+                "noKernelTun": True,
+            },
+        }
+        for candidate in endpoint_candidates(endpoint)
+    ]
+
+
+def outbound_test_passed(result: dict[str, Any]) -> bool:
+    obj = result.get("obj")
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except json.JSONDecodeError:
+            return False
+    return isinstance(obj, dict) and obj.get("success") is True
+
+
+def test_outbound(api: ApiClient, outbound: dict[str, Any], other_outbounds: list[dict[str, Any]]) -> bool:
+    for _ in range(2):
+        try:
+            result = api.request("panel/api/xray/testOutbound", "POST", form={
+                "outbound": json.dumps(outbound, separators=(",", ":")),
+                "allOutbounds": json.dumps(other_outbounds + [outbound], separators=(",", ":")),
+                "mode": "real",
+            })
+        except RuntimeError:
+            continue
+        if outbound_test_passed(result):
+            return True
+    return False
+
+
+def select_working_warp(api: ApiClient, template: dict[str, Any]) -> dict[str, Any]:
+    current = template.get("outbounds") or []
+    if not isinstance(current, list):
+        raise RuntimeError("3x-UI returned invalid Xray outbounds")
+    other_outbounds = [entry for entry in current if isinstance(entry, dict) and entry.get("tag") != "warp"]
+    existing = next((entry for entry in current if isinstance(entry, dict) and entry.get("tag") == "warp"), None)
+    if existing and test_outbound(api, existing, other_outbounds):
+        return existing
+    for candidate in build_warp_candidates(register_warp()):
+        if test_outbound(api, candidate, other_outbounds):
+            return candidate
+    raise RuntimeError("No Cloudflare WARP endpoint passed the real outbound test")
+
+
+def route_uses_all_tags(template: dict[str, Any], inbound_tags: list[str]) -> bool:
+    rules = (template.get("routing") or {}).get("rules") or []
+    return any(
+        isinstance(rule, dict)
+        and rule.get("outboundTag") == "warp"
+        and set(rule.get("inboundTag") or []) == set(inbound_tags)
+        for rule in rules
+    )
+
+
+def verify_installed_warp(api: ApiClient, template: dict[str, Any], inbound_tags: list[str]) -> None:
+    outbounds = template.get("outbounds") or []
+    warp = next((entry for entry in outbounds if isinstance(entry, dict) and entry.get("tag") == "warp"), None)
+    if not warp:
+        raise RuntimeError("Cloudflare WARP outbound is missing")
+    others = [entry for entry in outbounds if isinstance(entry, dict) and entry.get("tag") != "warp"]
+    if not route_uses_all_tags(template, inbound_tags):
+        raise RuntimeError("Cloudflare CDN inbounds are not all routed through WARP")
+    if not test_outbound(api, warp, others):
+        raise RuntimeError("Cloudflare WARP failed the real outbound verification")
 
 
 def main() -> int:
@@ -126,56 +275,22 @@ def main() -> int:
     api = ApiClient(args.panel_url, args.username, args.password)
     api.login()
     inbound_tags = warp_inbound_tags(api)
-    xray_response = api.request("panel/api/xray/", "POST")
-    obj = xray_response.get("obj") or {}
-    if isinstance(obj, str):
-        try:
-            obj = json.loads(obj)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("3x-UI returned an invalid Xray template wrapper") from exc
-    raw_template = obj.get("xraySetting") if isinstance(obj, dict) else None
-    if isinstance(raw_template, str):
-        template = json.loads(raw_template)
-    elif isinstance(raw_template, dict):
-        template = raw_template
-    else:
-        raise RuntimeError("3x-UI did not return an Xray template")
+    template = load_xray_template(api)
+    if args.verify_only:
+        verify_installed_warp(api, template, inbound_tags)
+        print("Cloudflare WARP real outbound and all four CDN routes verified.")
+        return 0
 
-    current_outbounds = template.get("outbounds", [])
-    existing_warp = next((entry for entry in current_outbounds if entry.get("tag") == "warp"), None)
-    outbounds = [entry for entry in current_outbounds if entry.get("tag") != "warp"]
-    if existing_warp:
-        outbounds.append(existing_warp)
-    else:
-        warp = register_warp()
-        config = warp.get("config") or {}
-        peer = (config.get("peers") or [{}])[0]
-        private_key = str(warp.get("_private_key", ""))
-        public_key = str(peer.get("public_key", ""))
-        endpoint = str((peer.get("endpoint") or {}).get("host", ""))
-        addresses = config.get("interface", {}).get("addresses", {})
-        client_id = str(config.get("client_id", ""))
-        if not all([private_key, public_key, endpoint, addresses.get("v4"), client_id]):
-            raise RuntimeError("Cloudflare WARP returned an incomplete configuration")
-        reserved = list(base64.b64decode(client_id))
-        outbounds.append({
-            "protocol": "wireguard",
-            "tag": "warp",
-            "settings": {
-                "secretKey": private_key,
-                "address": [f"{addresses['v4']}/32"] + ([f"{addresses['v6']}/128"] if addresses.get("v6") else []),
-                "peers": [{"publicKey": public_key, "endpoint": endpoint, "allowedIPs": ["0.0.0.0/0", "::/0"]}],
-                "reserved": reserved,
-                "mtu": 1280,
-            },
-        })
+    warp = select_working_warp(api, template)
+    current_outbounds = template.get("outbounds") or []
+    template["outbounds"] = [entry for entry in current_outbounds if isinstance(entry, dict) and entry.get("tag") != "warp"] + [warp]
     routing = template.setdefault("routing", {})
-    rules = [rule for rule in routing.get("rules", []) if rule.get("outboundTag") != "warp"]
+    rules = [rule for rule in routing.get("rules", []) if not (isinstance(rule, dict) and rule.get("outboundTag") == "warp")]
     rules.append({"type": "field", "inboundTag": inbound_tags, "outboundTag": "warp"})
     routing["rules"] = rules
-    template["outbounds"] = outbounds
-    api.request("panel/api/xray/update", "POST", form={"xraySetting": json.dumps(template, separators=(",", ":")), "outboundTestUrl": "https://www.google.com/generate_204"})
-    print("Cloudflare WARP outbound configured through the 3x-UI API.")
+    api.request("panel/api/xray/update", "POST", form={"xraySetting": json.dumps(template, separators=(",", ":")), "outboundTestUrl": WARP_TEST_URL})
+    verify_installed_warp(api, load_xray_template(api), inbound_tags)
+    print("Cloudflare WARP configured and passed real outbound verification for all CDN routes.")
     return 0
 
 
