@@ -9,11 +9,11 @@ works with both PostgreSQL and SQLite panel backends and stays compatible with
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
 import secrets
+import socket
 import sys
 import tempfile
 import urllib.error
@@ -26,6 +26,7 @@ from typing import Any
 
 
 ALL_PORTS = (10001, 10002, 10003, 10004, 10005, 8443)
+RETIRED_PORTS = (10004, 8443)
 
 
 @dataclass
@@ -105,8 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sub-path", default="sub")
     parser.add_argument("--cdn-domain", required=True)
     parser.add_argument("--direct-domain", required=True)
-    parser.add_argument("--reality-dest", default="www.google.com:443")
-    parser.add_argument("--reality-server-name", default="www.google.com")
+    parser.add_argument("--disable-outline-direct", action="store_true")
     parser.add_argument("--server-label", default=os.environ.get("SERVER_LABEL", "SG1"))
     parser.add_argument("--deployment-profile", choices=("full", "cdn_vless_backup"), default="full")
     parser.add_argument("--profiles-file", default="/etc/bds-dpi-bypass/subscription-profiles.json")
@@ -265,39 +265,6 @@ def resolve_profiles(existing: list[dict[str, Any]], profiles_file: Path) -> dic
     return profiles
 
 
-def reality_public_key(private_key: str) -> str:
-    try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import x25519
-    except ImportError as exc:
-        raise RuntimeError("python3-cryptography is required for Reality key handling") from exc
-    padded = private_key + "=" * (-len(private_key) % 4)
-    private = x25519.X25519PrivateKey.from_private_bytes(base64.urlsafe_b64decode(padded))
-    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    return base64.urlsafe_b64encode(public).decode().rstrip("=")
-
-
-def extract_existing_reality_key(existing: list[dict[str, Any]]) -> tuple[str, str, list[str]] | None:
-    for item in existing:
-        if not isinstance(item, dict):
-            continue
-        try:
-            port = int(item.get("port"))
-        except (TypeError, ValueError):
-            continue
-        if port != 8443:
-            continue
-        stream = json_field(item.get("streamSettings"), {})
-        reality = stream.get("realitySettings")
-        if isinstance(reality, dict) and reality.get("privateKey"):
-            private_key = str(reality["privateKey"])
-            client_settings = reality.get("settings") if isinstance(reality.get("settings"), dict) else {}
-            public_key = str(client_settings.get("publicKey") or reality.get("publicKey") or reality_public_key(private_key))
-            short_ids = [str(value) for value in reality.get("shortIds", []) if value]
-            return private_key, public_key, short_ids or [secrets.token_hex(4)]
-    return None
-
-
 def external_proxy(host: str, port: int, force_tls: bool = False) -> list[dict[str, Any]]:
     item: dict[str, Any] = {"dest": host, "port": port}
     if force_tls:
@@ -305,21 +272,28 @@ def external_proxy(host: str, port: int, force_tls: bool = False) -> list[dict[s
     return [item]
 
 
-def build_specs(args: argparse.Namespace, profiles: dict[str, ProfileValues], private_key: str, public_key: str, short_ids: list[str]) -> list[dict[str, Any]]:
-    cdn_proxy = external_proxy(args.cdn_domain, 443, True)
+def resolve_cdn_ipv4(domain: str) -> list[str]:
+    addresses = sorted({item[4][0] for item in socket.getaddrinfo(domain, 443, socket.AF_INET, socket.SOCK_STREAM)})
+    if not addresses:
+        raise RuntimeError(f"CDN domain has no IPv4 address: {domain}")
+    return addresses
+
+
+def build_specs(args: argparse.Namespace, profiles: dict[str, ProfileValues]) -> list[dict[str, Any]]:
+    cdn_addresses = resolve_cdn_ipv4(args.cdn_domain)
     direct_ss_proxy = external_proxy(args.direct_domain, 10005)
-    direct_reality_proxy = external_proxy(args.direct_domain, 8443)
     client = profiles["client"]
     common = {"email": client.email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True, "tgId": 0, "subId": client.sub_id, "reset": 0}
-    ws = lambda path: {"network": "ws", "security": "none", "externalProxy": cdn_proxy, "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": path, "headers": {"Host": args.cdn_domain}}}
+    def ws(path: str, address: str) -> dict[str, Any]:
+        return {"network": "ws", "security": "none", "externalProxy": external_proxy(address, 443, True), "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": path, "headers": {"Host": args.cdn_domain}}}
+    address = lambda index: cdn_addresses[index % len(cdn_addresses)]
     specs = [
-        {"profile": "client", "subSortIndex": 10, "protocol": "vless", "port": 10001, "remark": f"{args.server_label} - VLESS WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": args.cdn_domain, "settings": {"clients": [{**common, "id": client.client_id}], "decryption": "none", "fallbacks": []}, "streamSettings": ws("/vless-ws")},
-        {"profile": "client", "subSortIndex": 20, "protocol": "vmess", "port": 10002, "remark": f"{args.server_label} - VMess WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": args.cdn_domain, "settings": {"clients": [{**common, "id": client.client_id, "alterId": 0, "security": "aes-128-gcm"}]}, "streamSettings": ws("/vmess-ws")},
-        {"profile": "client", "subSortIndex": 30, "protocol": "trojan", "port": 10003, "remark": f"{args.server_label} - Trojan WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": args.cdn_domain, "settings": {"clients": [{**common, "password": client.password}]}, "streamSettings": ws("/trojan-ws")},
-        {"profile": "client", "subSortIndex": 40, "protocol": "shadowsocks", "port": 10004, "remark": f"{args.server_label} - Shadowsocks WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": args.cdn_domain, "settings": {"method": "chacha20-ietf-poly1305", "password": client.password, "network": "tcp,udp", "clients": [{**common, "method": "chacha20-ietf-poly1305", "password": client.password}]}, "streamSettings": ws("/ss-ws")},
-        {"profile": "client", "subSortIndex": 50, "protocol": "shadowsocks", "port": 10005, "remark": f"{args.server_label} - Shadowsocks Direct", "listen": "0.0.0.0", "shareAddrStrategy": "custom", "shareAddr": args.direct_domain, "settings": {"method": "chacha20-ietf-poly1305", "password": client.password, "network": "tcp,udp", "ivCheck": False, "clients": [{**common, "method": "chacha20-ietf-poly1305", "password": client.password}]}, "streamSettings": {"network": "tcp", "security": "none", "externalProxy": direct_ss_proxy, "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}}},
-        {"profile": "client", "subSortIndex": 60, "protocol": "vless", "port": 8443, "remark": f"{args.server_label} - VLESS Reality Direct", "listen": "0.0.0.0", "shareAddrStrategy": "custom", "shareAddr": args.direct_domain, "settings": {"clients": [{**common, "id": client.client_id, "flow": "xtls-rprx-vision"}], "decryption": "none", "fallbacks": []}, "streamSettings": {"network": "tcp", "security": "reality", "externalProxy": direct_reality_proxy, "realitySettings": {"show": False, "xver": 0, "dest": args.reality_dest, "serverNames": [args.reality_server_name], "privateKey": private_key, "settings": {"publicKey": public_key, "fingerprint": "chrome", "spiderX": "/"}, "minClientVer": "", "maxClientVer": "", "maxTimeDiff": 0, "shortIds": short_ids}, "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}}},
+        {"profile": "client", "subSortIndex": 10, "protocol": "vless", "port": 10001, "remark": f"{args.server_label} - VLESS WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": address(0), "settings": {"clients": [{**common, "id": client.client_id}], "decryption": "none", "fallbacks": []}, "streamSettings": ws("/vless-ws", address(0))},
+        {"profile": "client", "subSortIndex": 20, "protocol": "vmess", "port": 10002, "remark": f"{args.server_label} - VMess WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": address(1), "settings": {"clients": [{**common, "id": client.client_id, "alterId": 0, "security": "aes-128-gcm"}]}, "streamSettings": ws("/vmess-ws", address(1))},
+        {"profile": "client", "subSortIndex": 30, "protocol": "trojan", "port": 10003, "remark": f"{args.server_label} - Trojan WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": address(0), "settings": {"clients": [{**common, "password": client.password}]}, "streamSettings": ws("/trojan-ws", address(0))},
     ]
+    if not args.disable_outline_direct:
+        specs.append({"profile": "client", "subSortIndex": 40, "protocol": "shadowsocks", "port": 10005, "remark": f"{args.server_label} - Shadowsocks Direct", "listen": "0.0.0.0", "shareAddrStrategy": "custom", "shareAddr": args.direct_domain, "settings": {"method": "chacha20-ietf-poly1305", "password": client.password, "network": "tcp,udp", "ivCheck": False, "clients": [{**common, "method": "chacha20-ietf-poly1305", "password": client.password}]}, "streamSettings": {"network": "tcp", "security": "none", "externalProxy": direct_ss_proxy, "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}}})
     return specs[:1] if getattr(args, "deployment_profile", "full") == "cdn_vless_backup" else specs
 
 
@@ -389,6 +363,15 @@ def configure_inbounds(api: ApiClient, existing: list[dict[str, Any]], specs: li
             api.request("panel/api/inbounds/add", "POST", payload)
 
 
+def disable_retired_inbounds(api: ApiClient, existing: list[dict[str, Any]], retired_ports: set[int]) -> None:
+    for item in existing:
+        if not isinstance(item, dict) or int(item.get("port", 0)) not in retired_ports or item.get("enable") is False:
+            continue
+        payload = {key: value for key, value in item.items() if key != "clientStats"}
+        payload["enable"] = False
+        api.request(f"panel/api/inbounds/update/{item['id']}", "POST", payload)
+
+
 def main() -> int:
     args = parse_args()
     if not args.username or not args.password:
@@ -402,30 +385,19 @@ def main() -> int:
         raise RuntimeError("Unexpected inbound list response")
     profiles_file = Path(args.profiles_file)
     profiles = resolve_profiles(existing, profiles_file)
-    # 3x-UI provides its own Reality key generator; generated key material is
-    # kept in the panel database and never written to the repository.
-    current_key = extract_existing_reality_key(existing)
+    specs = build_specs(args, profiles)
+    retired_ports = set(ALL_PORTS) - {int(spec["port"]) for spec in specs}
     if args.dry_run:
-        private_key = current_key[0] if current_key else "dry-run-private-key"
-        public_key = current_key[1] if current_key else "dry-run-public-key"
-        short_ids = current_key[2] if current_key else ["dryrun00"]
-        specs = build_specs(args, profiles, private_key, public_key, short_ids)
         by_port = {int(item.get("port")): item for item in existing if isinstance(item, dict) and item.get("port") is not None}
         for spec in specs:
             merge_managed_clients(by_port.get(spec["port"]), spec, profiles)
-        print(f"Dry run passed: unified {args.server_label} client will cover {len(specs)} managed inbound(s); unrelated clients are preserved.")
+        print(f"Dry run passed: unified {args.server_label} client will cover {len(specs)} supported inbounds; unrelated clients are preserved.")
         return 0
     configure_settings(api, args)
-    key_result = (api.request("panel/api/server/getNewX25519Cert").get("obj") or {}) if current_key is None else {}
-    private_key = current_key[0] if current_key else str(key_result.get("privateKey", ""))
-    public_key = current_key[1] if current_key else str(key_result.get("publicKey", ""))
-    short_ids = current_key[2] if current_key else [secrets.token_hex(4)]
-    if not private_key or not public_key:
-        raise RuntimeError("3x-UI did not return a complete X25519 key pair")
-    specs = build_specs(args, profiles, private_key, public_key, short_ids)
     configure_inbounds(api, existing, specs, profiles)
+    disable_retired_inbounds(api, existing, retired_ports)
     save_profiles(profiles_file, profiles, f"https://{args.sub_domain}/{args.sub_path.strip('/')}/", args.server_label)
-    print(f"Configured one unified {args.server_label} client across {len(specs)} managed inbound(s). Profile: {profiles_file}")
+    print(f"Configured one unified {args.server_label} client across {len(specs)} supported BDS inbounds. Profile: {profiles_file}")
     return 0
 
 

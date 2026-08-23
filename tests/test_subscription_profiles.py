@@ -95,23 +95,26 @@ class SubscriptionProfileTests(unittest.TestCase):
             args = SimpleNamespace(
                 cdn_domain="cdn.example.com",
                 direct_domain="direct.example.com",
-                reality_dest="www.google.com:443",
-                reality_server_name="www.google.com",
+                disable_outline_direct=False,
                 server_label="SG1",
             )
-            specs = configure.build_specs(args, profiles, "private", "public", ["abcd1234"])
+            with mock.patch.object(configure, "resolve_cdn_ipv4", return_value=["104.21.1.1", "172.67.1.1"]):
+                specs = configure.build_specs(args, profiles)
             self.assertEqual(
                 [spec["remark"] for spec in specs],
                 [
                     "SG1 - VLESS WS CDN",
                     "SG1 - VMess WS CDN",
                     "SG1 - Trojan WS CDN",
-                    "SG1 - Shadowsocks WS CDN",
                     "SG1 - Shadowsocks Direct",
-                    "SG1 - VLESS Reality Direct",
                 ],
             )
-            self.assertEqual([spec["subSortIndex"] for spec in specs], [10, 20, 30, 40, 50, 60])
+            self.assertEqual([spec["subSortIndex"] for spec in specs], [10, 20, 30, 40])
+            self.assertEqual([spec["shareAddr"] for spec in specs[:3]], ["104.21.1.1", "172.67.1.1", "104.21.1.1"])
+            for spec in specs[:3]:
+                proxy = spec["streamSettings"]["externalProxy"][0]
+                self.assertEqual(proxy, {"dest": spec["shareAddr"], "port": 443, "forceTls": "tls"})
+                self.assertEqual(spec["streamSettings"]["wsSettings"]["host"], "cdn.example.com")
             vmess = next(spec for spec in specs if spec["port"] == 10002)
             self.assertEqual(vmess["settings"]["clients"][0]["security"], "aes-128-gcm")
             existing_by_port = {item["port"]: item for item in existing}
@@ -124,6 +127,24 @@ class SubscriptionProfileTests(unittest.TestCase):
                 self.assertNotIn(profiles["legacy_advanced"].sub_id, sub_ids)
                 if spec["port"] == 10005:
                     self.assertIn(self.unrelated["subId"], sub_ids)
+
+            args.disable_outline_direct = True
+            with mock.patch.object(configure, "resolve_cdn_ipv4", return_value=["104.21.1.1"]):
+                self.assertEqual([spec["port"] for spec in configure.build_specs(args, profiles)], [10001, 10002, 10003])
+
+    def test_retired_inbounds_are_disabled_without_deletion(self) -> None:
+        api = mock.MagicMock()
+        existing = [
+            {"id": 4, "port": 10004, "enable": True, "remark": "SS WS", "clientStats": []},
+            {"id": 5, "port": 10005, "enable": True, "remark": "Outline"},
+            {"id": 6, "port": 8443, "enable": True, "remark": "Reality"},
+        ]
+        configure.disable_retired_inbounds(api, existing, {10004, 8443})
+        calls = api.request.call_args_list
+        self.assertEqual([call.args[0] for call in calls], ["panel/api/inbounds/update/4", "panel/api/inbounds/update/6"])
+        self.assertTrue(all(call.args[1] == "POST" for call in calls))
+        self.assertTrue(all(call.args[2]["enable"] is False for call in calls))
+        self.assertTrue(all("clientStats" not in call.args[2] for call in calls))
 
     def test_v2_profiles_file_round_trip_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -201,15 +222,13 @@ class SubscriptionProfileTests(unittest.TestCase):
         self.assertNotIn(self.advanced.sub_id, rendered)
         self.assertEqual(rendered.count("https://"), 1)
 
-    def test_unified_subscription_check_requires_all_six_profiles(self) -> None:
+    def test_unified_subscription_check_requires_four_supported_profiles(self) -> None:
         raw = "\n".join(
             (
                 "vless://cdn",
                 "vmess://cdn",
                 "trojan://cdn",
-                "ss://cdn",
                 "ss://direct",
-                "vless://reality",
             )
         ).encode()
 
@@ -222,7 +241,7 @@ class SubscriptionProfileTests(unittest.TestCase):
                 "sub.example.com",
             )
 
-        self.assertEqual(count, 6)
+        self.assertEqual(count, 4)
         self.assertEqual(schemes, ["ss", "trojan", "vless", "vmess"])
         request = urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "http://127.0.0.1:2096/sub/client-subscription-id")
@@ -235,15 +254,14 @@ class SubscriptionProfileTests(unittest.TestCase):
                 "vmess://cdn-one",
                 "vmess://cdn-two",
                 "trojan://cdn",
-                "ss://direct",
-                "vless://reality",
+                "vless://duplicate",
             )
         ).encode()
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = base64.b64encode(raw)
 
         with mock.patch.object(show.urllib.request, "urlopen", return_value=response):
-            with self.assertRaisesRegex(RuntimeError, r"ss \(1/2\)"):
+            with self.assertRaisesRegex(RuntimeError, r"ss \(0/1\)"):
                 show.check_profile(
                     {"sub_id": "client-subscription-id"},
                     "http://127.0.0.1:2096/sub",

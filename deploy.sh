@@ -40,8 +40,7 @@ load_config() {
     SUB_PROFILE_FILE="${SUB_PROFILE_FILE:-/etc/bds-dpi-bypass/subscription-profiles.json}"
     TLS_CERT_FILE="${TLS_CERT_FILE:-/etc/nginx/ssl/bds-node/cert.pem}"
     TLS_KEY_FILE="${TLS_KEY_FILE:-/etc/nginx/ssl/bds-node/key.pem}"
-    REALITY_DEST="${REALITY_DEST:-www.google.com:443}"
-    REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.google.com}"
+    ENABLE_OUTLINE_SHADOWSOCKS_DIRECT="${ENABLE_OUTLINE_SHADOWSOCKS_DIRECT:-true}"
     ENABLE_BBR="${ENABLE_BBR:-true}"
     ENABLE_UFW="${ENABLE_UFW:-false}"
     DEPLOYMENT_PROFILE="${DEPLOYMENT_PROFILE:-full}"
@@ -49,7 +48,7 @@ load_config() {
     export SERVER_LABEL PANEL_DOMAIN SUB_DOMAIN CDN_DOMAIN DIRECT_DOMAIN
     export XUI_PANEL_PORT XUI_SUB_PORT XUI_WEB_BASE_PATH XUI_SUB_PATH
     export SUB_PROFILE_FILE
-    export TLS_CERT_FILE TLS_KEY_FILE REALITY_DEST REALITY_SERVER_NAME
+    export TLS_CERT_FILE TLS_KEY_FILE ENABLE_OUTLINE_SHADOWSOCKS_DIRECT
     export DEPLOYMENT_PROFILE
 }
 
@@ -71,9 +70,10 @@ validate_config() {
     [[ "${XUI_WEB_BASE_PATH}" =~ ^[A-Za-z0-9_-]{4,64}$ ]] || die "XUI_WEB_BASE_PATH must be 4-64 safe characters."
     [[ "${XUI_SUB_PATH}" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "XUI_SUB_PATH must be 1-64 safe characters."
     [[ "${SUB_PROFILE_FILE}" == /* ]] || die "SUB_PROFILE_FILE must be an absolute path."
-    [[ "${REALITY_DEST}" =~ ^[^[:space:]:]+:[0-9]+$ ]] || die "REALITY_DEST must look like host:port."
     [[ "${DEPLOYMENT_PROFILE}" == "full" || "${DEPLOYMENT_PROFILE}" == "cdn_vless_backup" ]] \
         || die "DEPLOYMENT_PROFILE must be full or cdn_vless_backup."
+    [[ "${ENABLE_OUTLINE_SHADOWSOCKS_DIRECT}" =~ ^(true|false)$ ]] \
+        || die "ENABLE_OUTLINE_SHADOWSOCKS_DIRECT must be true or false."
 }
 
 preflight() {
@@ -151,7 +151,7 @@ ensure_secret_file() {
 install_base_packages() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl nginx openssl python3 python3-cryptography postgresql-client sudo tar gzip
+    apt-get install -y ca-certificates curl nginx openssl python3 postgresql-client sudo tar gzip
 }
 
 ensure_postgres_backend() {
@@ -260,6 +260,10 @@ install_3xui() {
 }
 
 configure_3xui() {
+    local outline_args=()
+    if [[ "${ENABLE_OUTLINE_SHADOWSOCKS_DIRECT}" == "false" ]]; then
+        outline_args+=(--disable-outline-direct)
+    fi
     python3 "${SCRIPT_DIR}/scripts/04_configure_3xui_db.py" \
         --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
         --server-label "${SERVER_LABEL}" \
@@ -268,12 +272,11 @@ configure_3xui() {
         --sub-path "${XUI_SUB_PATH}" \
         --cdn-domain "${CDN_DOMAIN}" \
         --direct-domain "${DIRECT_DOMAIN}" \
-        --reality-dest "${REALITY_DEST}" \
-        --reality-server-name "${REALITY_SERVER_NAME}" \
         --deployment-profile "${DEPLOYMENT_PROFILE}" \
-        --profiles-file "${SUB_PROFILE_FILE}"
+        --profiles-file "${SUB_PROFILE_FILE}" \
+        "${outline_args[@]}"
 
-    local warp_ports="10001,10002,10003,10004"
+    local warp_ports="10001,10002,10003"
     [[ "${DEPLOYMENT_PROFILE}" == "full" ]] || warp_ports="10001"
     python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
         --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
@@ -285,21 +288,28 @@ install_operator_tools() {
     install -m 755 "${SCRIPT_DIR}/scripts/03_setup_warp.py" /usr/local/sbin/bds-dpi-verify-warp
 }
 
+configure_fail2ban() {
+    command -v fail2ban-client >/dev/null 2>&1 || return 0
+    install -d -m 755 /etc/fail2ban/jail.d
+    printf '[3x-ipl]\nenabled = false\n' > /etc/fail2ban/jail.d/99-bds-disable-3x-ipl.local
+    systemctl restart fail2ban
+}
+
 configure_network() {
     if [[ "${ENABLE_BBR}" == "true" ]]; then
         bash "${SCRIPT_DIR}/scripts/01_setup_bbr.sh"
     fi
     bash "${SCRIPT_DIR}/scripts/02_setup_nginx.sh"
+    configure_fail2ban
 
     if [[ "${ENABLE_UFW}" == "true" ]]; then
         command -v ufw >/dev/null 2>&1 || apt-get install -y ufw
         ufw allow OpenSSH
         ufw allow 80/tcp
         ufw allow 443/tcp
-        if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
+        if [[ "${DEPLOYMENT_PROFILE}" == "full" && "${ENABLE_OUTLINE_SHADOWSOCKS_DIRECT}" == "true" ]]; then
             ufw allow 10005/tcp
             ufw allow 10005/udp
-            ufw allow 8443/tcp
         fi
         ufw --force enable
     fi
@@ -317,16 +327,19 @@ verify() {
         --resolve "${CDN_DOMAIN}:443:127.0.0.1" \
         "https://${CDN_DOMAIN}/healthz" --insecure | grep -qx 'OK'
     ss -lnt | grep -Eq ":10001[[:space:]]" || die "VLESS CDN port 10001 is not listening."
-    if [[ "${DEPLOYMENT_PROFILE}" == "full" ]]; then
+    if [[ "${DEPLOYMENT_PROFILE}" == "full" && "${ENABLE_OUTLINE_SHADOWSOCKS_DIRECT}" == "true" ]]; then
         ss -lnt | grep -Eq ":10005[[:space:]]" || die "Direct Shadowsocks port 10005 is not listening."
-        ss -lnt | grep -Eq ":8443[[:space:]]" || die "Reality port 8443 is not listening."
+    else
+        ! ss -lnt | grep -Eq ":10005[[:space:]]" || die "Direct Shadowsocks port 10005 should be disabled."
     fi
+    ! ss -lnt | grep -Eq ":10004[[:space:]]" || die "Retired Shadowsocks WS port 10004 is still listening."
+    ! ss -lnt | grep -Eq ":8443[[:space:]]" || die "Retired Reality port 8443 is still listening."
     python3 "${SCRIPT_DIR}/scripts/05_show_subscriptions.py" \
         --profiles-file "${SUB_PROFILE_FILE}" \
         --check-url-base "http://127.0.0.1:${XUI_SUB_PORT}/${XUI_SUB_PATH}" \
         --host-header "${SUB_DOMAIN}" \
         --expected-profile "${DEPLOYMENT_PROFILE}"
-    local warp_ports="10001,10002,10003,10004"
+    local warp_ports="10001,10002,10003"
     [[ "${DEPLOYMENT_PROFILE}" == "full" ]] || warp_ports="10001"
     python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
         --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \

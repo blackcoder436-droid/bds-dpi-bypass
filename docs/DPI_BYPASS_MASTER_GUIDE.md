@@ -21,14 +21,14 @@
 1. **`panel.bds-node.me`** ➡️ 3x-ui Admin Panel ဝင်ရောက်ရန်
 2. **`sub.bds-node.me`** ➡️ User များကို Subscription Link ပေးရန် (**Proxied 🟠**)
 3. **`cdn.bds-node.me`** ➡️ Cloudflare CDN ခံသုံးမည့် Inbounds များအတွက် (**Proxied 🟠**)
-4. **`direct.bds-node.me`** ➡️ Direct IP သုံးမည့် Reality / Shadowsocks များအတွက် (**DNS Only ☁️**)
+4. **`direct.bds-node.me`** ➡️ Outline compatibility အတွက် ယာယီ Shadowsocks Direct သုံးရန် (**DNS Only ☁️**)
 
 ---
 
 ## 🔌 ၃။ Protocol, Port & Cloudflare Integration Matrix
 
 Cloudflare CDN (Orange Cloud 🟠) ခံသုံးပါက အောက်ပါ HTTPS Ports များကိုသာ ခွင့်ပြုပါသည် -  
-`443`, `8443`, `2053`, `2083`, `2087`, `2096`
+`443`, `2053`, `2083`, `2087`, `2096`
 
 | Service / Protocol | Port | Network/Transport | Cloudflare Proxy Status | Domain / Host Target |
 | :--- | :--- | :--- | :--- | :--- |
@@ -37,9 +37,7 @@ Cloudflare CDN (Orange Cloud 🟠) ခံသုံးပါက အောက်�
 | **VLESS (CDN)** | `443` (Port 10001) | WebSocket (`ws`) | **Proxied (Orange 🟠)** | Path: `/vless-ws` |
 | **VMess (CDN)** | `443` (Port 10002) | WebSocket (`ws`) | **Proxied (Orange 🟠)** | Path: `/vmess-ws` |
 | **Trojan (CDN)** | `443` (Port 10003) | WebSocket (`ws`) | **Proxied (Orange 🟠)** | Path: `/trojan-ws` |
-| **Shadowsocks (CDN)** | `443` (Port 10004) | WebSocket (`ws`) | **Proxied (Orange 🟠)** | Path: `/ss-ws` |
 | **Shadowsocks Direct** | `10005` | TCP (`chacha20-ietf-poly1305`) | **DNS Only (Gray ☁️)** | `direct.bds-node.me` |
-| **VLESS Reality Direct**| `8443` | TCP (`xtls-rprx-vision`) | **DNS Only (Gray ☁️)** | `direct.bds-node.me` |
 
 > 💡 **Best Practice Note:** Port `443` တစ်ခုတည်းတွင် Path ကို မတူအောင် ခွဲထုတ်ခြင်း (`/vless-ws`, `/vmess-ws`, `/trojan-ws`, `/ss-ws`) ဖြင့် Cloudflare CDN Inbound များကို အထိရောက်ဆုံး တည်ဆောက်နိုင်ပါသည်။
 

@@ -42,6 +42,35 @@ PY
 
 ln -sfn "${TARGET}" "${ENABLED}"
 
+# 3x-UI nodes can have hundreds of concurrent long-lived WebSocket sessions.
+# Keep the global event capacity deterministic on every fresh or replacement VPS.
+python3 - /etc/nginx/nginx.conf <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+if re.search(r"worker_rlimit_nofile\s+\d+;", source):
+    source = re.sub(r"worker_rlimit_nofile\s+\d+;", "worker_rlimit_nofile 65535;", source, count=1)
+else:
+    match = re.search(r"worker_processes\s+[^;]+;", source)
+    if not match:
+        raise SystemExit("worker_processes directive not found")
+    source = source[:match.end()] + "\nworker_rlimit_nofile 65535;" + source[match.end():]
+source = re.sub(r"worker_connections\s+\d+;", "worker_connections 8192;", source, count=1)
+events = re.search(r"events\s*\{(?P<body>.*?)\}", source, re.DOTALL)
+if not events:
+    raise SystemExit("events block not found")
+body = events.group("body")
+if re.search(r"#?\s*multi_accept\s+(?:on|off);", body):
+    body = re.sub(r"#?\s*multi_accept\s+(?:on|off);", "\n    multi_accept on;", body)
+else:
+    body += "\n    multi_accept on;\n"
+source = source[:events.start("body")] + body + source[events.end("body"):]
+path.write_text(source, encoding="utf-8")
+PY
+
 # These legacy files overlap the generated hostnames. The master installer has
 # already archived /etc/nginx before this cleanup.
 rm -f /etc/nginx/sites-enabled/bds-node /etc/nginx/sites-enabled/bds-node.conf

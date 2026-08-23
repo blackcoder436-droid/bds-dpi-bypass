@@ -82,9 +82,9 @@ def check_profile(profile: dict[str, Any], base_url: str, host_header: str | Non
         if len(links) != 1 or schemes != ["vless"]:
             raise RuntimeError("Backup subscription must contain exactly one VLESS profile")
         return len(links), schemes
-    if len(links) < 6:
-        raise RuntimeError("Client subscription returned fewer than six profiles")
-    required_counts = {"vless": 2, "ss": 2, "vmess": 1, "trojan": 1}
+    if len(links) < 4:
+        raise RuntimeError("Client subscription returned fewer than four profiles")
+    required_counts = {"vless": 1, "ss": 1, "vmess": 1, "trojan": 1}
     missing = [
         f"{scheme} ({schemes.count(scheme)}/{minimum})"
         for scheme, minimum in required_counts.items()
@@ -107,7 +107,7 @@ def main() -> int:
     base_url = str(profiles["sub_base_url"]).rstrip("/")
     print(f"Client subscription: {base_url}/{profiles['client']['sub_id']}")
     print("VMess uses explicit AES-128-GCM for Hiddify/sing-box and Xray compatibility.")
-    print("Direct profiles can still be blocked by the current ISP or mobile network.")
+    print("Only the temporary Outline-compatible Shadowsocks profile uses a direct connection.")
     return 0
 
 

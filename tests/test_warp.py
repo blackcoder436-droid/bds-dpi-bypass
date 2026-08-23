@@ -90,7 +90,7 @@ class WarpProvisioningTests(unittest.TestCase):
                 warp.select_working_warp(api, {"outbounds": []})
 
     def test_verification_requires_all_runtime_cdn_tags_and_real_test(self) -> None:
-        tags = [f"in-{port}-tcp" for port in (10001, 10002, 10003, 10004)]
+        tags = [f"in-{port}-tcp" for port in (10001, 10002, 10003)]
         template = {
             "outbounds": [{"protocol": "wireguard", "tag": "warp", "settings": {}}],
             "routing": {"rules": [{"type": "field", "inboundTag": tags, "outboundTag": "warp"}]},
@@ -102,7 +102,7 @@ class WarpProvisioningTests(unittest.TestCase):
             warp.verify_installed_warp(FakeApi([False]), template, tags)
 
     def test_update_payload_keeps_exact_runtime_tags(self) -> None:
-        tags = [f"in-{port}-tcp" for port in (10001, 10002, 10003, 10004)]
+        tags = [f"in-{port}-tcp" for port in (10001, 10002, 10003)]
         template = {
             "outbounds": [{"protocol": "freedom", "tag": "direct"}],
             "routing": {"rules": []},
@@ -110,7 +110,7 @@ class WarpProvisioningTests(unittest.TestCase):
         api = mock.MagicMock()
         api.login.return_value = None
         api.request.side_effect = [
-            {"success": True, "obj": [{"port": port, "tag": tag} for port, tag in zip((10001, 10002, 10003, 10004), tags)]},
+            {"success": True, "obj": [{"port": port, "tag": tag} for port, tag in zip((10001, 10002, 10003), tags)]},
             {"success": True, "obj": {"xraySetting": json.dumps(template)}},
             {"success": True},
             {"success": True, "obj": {"xraySetting": json.dumps({

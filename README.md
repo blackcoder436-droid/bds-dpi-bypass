@@ -9,8 +9,7 @@ This standalone repository contains the complete enterprise **Anti-DPI VPN Infra
 - **Cloudflare CDN Protection (Orange Cloud 🟠):** Proxies `VLESS-WS`, `Trojan-WS`, `VMess-WS`, and `Shadowsocks-WS` traffic through Cloudflare Edge servers (`cdn.bds-node.me`), completely hiding the VPS origin IP from ISP DPI blocking.
 - **Cloudflare WARP Outbound (`wireguard` tag):** Automatically routes all CDN user traffic through Cloudflare WARP WireGuard interface (`104.28.222.x` exit IPs), unblocking ChatGPT, OpenAI, Netflix, and preventing Google CAPTCHA triggers.
 - **Direct Low-Latency Inbounds:**
-  - **`Shadowsocks-Direct` (Port 10005):** `chacha20-ietf-poly1305` fallback for networks that allow direct VPS access.
-  - **`VLESS-Reality-Direct` (Port 8443):** Advanced `xtls-rprx-vision` profile for current Xray clients.
+  - **`Shadowsocks-Direct` (Port 10005):** Temporary `chacha20-ietf-poly1305` compatibility for Outline users; controlled by `ENABLE_OUTLINE_SHADOWSOCKS_DIRECT`.
 - **One subscription per node:** A single client link contains all six inbound profiles with labels based on `SERVER_LABEL` (for example, `SG1 - VLESS WS CDN`). Direct profiles may expose the VPS IP and may be selected by client auto-balancing.
 - **Subdomain & Domain Isolation:** Dedicated VPN domain (`bds-node.me`) separated from primary web applications.
 - **Clean IP & TLS Fragmentation Support:** Compatible with Cloudflare Preferred IPs (`104.16.132.229`) and Client TLS Fragmentation to bypass SNI filtering.
@@ -65,7 +64,7 @@ sudo ./deploy.sh
 
 ## 📱 Subscription Profile
 
-Each node has one client subscription containing VLESS WS CDN, VMess WS CDN, Trojan WS CDN, Shadowsocks WS CDN, Shadowsocks Direct, and VLESS Reality Direct. Entry names use `SERVER_LABEL`, for example `SG1 - VLESS WS CDN` and `SG1 - VMess WS CDN`. VMess uses `aes-128-gcm` for Hiddify/sing-box and Xray compatibility.
+Each node has one client subscription containing VLESS WS CDN, VMess WS CDN, Trojan WS CDN, and the temporary Shadowsocks Direct profile. Shadowsocks WS and VLESS Reality are retired and are disabled idempotently on redeploy. CDN share addresses are pinned to resolved Cloudflare IPv4 addresses while keeping the CDN hostname in WS Host/SNI metadata. VMess uses `aes-128-gcm` for Hiddify/sing-box and Xray compatibility.
 
 Direct entries may reveal the VPS IP, may be selected by Hiddify auto-balancing, and may be blocked by the user's ISP. Generated subscription credentials are stored only in the root-readable file configured by `SUB_PROFILE_FILE`; they are never committed to this repository. On the VPS, display the single link with:
 
