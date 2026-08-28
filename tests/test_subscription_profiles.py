@@ -113,10 +113,24 @@ class SubscriptionProfileTests(unittest.TestCase):
             self.assertEqual([spec["shareAddr"] for spec in specs[:3]], ["104.21.1.1", "172.67.1.1", "104.21.1.1"])
             for spec in specs[:3]:
                 proxy = spec["streamSettings"]["externalProxy"][0]
-                self.assertEqual(proxy, {"dest": spec["shareAddr"], "port": 443, "forceTls": "tls"})
+                self.assertEqual(
+                    proxy,
+                    {
+                        "dest": spec["shareAddr"],
+                        "port": 443,
+                        "forceTls": "tls",
+                        "sni": "cdn.example.com",
+                    },
+                )
                 self.assertEqual(spec["streamSettings"]["wsSettings"]["host"], "cdn.example.com")
             vmess = next(spec for spec in specs if spec["port"] == 10002)
             self.assertEqual(vmess["settings"]["clients"][0]["security"], "aes-128-gcm")
+            host_payload = configure.build_host_payload(specs[0], 42)
+            self.assertEqual(host_payload["inboundIds"], [42])
+            self.assertEqual(host_payload["hosts"], ["104.21.1.1"])
+            self.assertEqual(host_payload["security"], "tls")
+            self.assertEqual(host_payload["sni"], "cdn.example.com")
+            self.assertFalse(host_payload["keepSniBlank"])
             existing_by_port = {item["port"]: item for item in existing}
             for spec in specs:
                 settings = configure.merge_managed_clients(existing_by_port[spec["port"]], spec, profiles)

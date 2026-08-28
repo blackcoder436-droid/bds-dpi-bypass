@@ -265,10 +265,18 @@ def resolve_profiles(existing: list[dict[str, Any]], profiles_file: Path) -> dic
     return profiles
 
 
-def external_proxy(host: str, port: int, force_tls: bool = False) -> list[dict[str, Any]]:
+def external_proxy(
+    host: str,
+    port: int,
+    force_tls: bool = False,
+    *,
+    sni: str | None = None,
+) -> list[dict[str, Any]]:
     item: dict[str, Any] = {"dest": host, "port": port}
     if force_tls:
         item["forceTls"] = "tls"
+    if sni:
+        item["sni"] = sni
     return [item]
 
 
@@ -285,7 +293,7 @@ def build_specs(args: argparse.Namespace, profiles: dict[str, ProfileValues]) ->
     client = profiles["client"]
     common = {"email": client.email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True, "tgId": 0, "subId": client.sub_id, "reset": 0}
     def ws(path: str, address: str) -> dict[str, Any]:
-        return {"network": "ws", "security": "none", "externalProxy": external_proxy(address, 443, True), "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": path, "headers": {"Host": args.cdn_domain}}}
+        return {"network": "ws", "security": "none", "externalProxy": external_proxy(address, 443, True, sni=args.cdn_domain), "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": path, "headers": {"Host": args.cdn_domain}}}
     address = lambda index: cdn_addresses[index % len(cdn_addresses)]
     specs = [
         {"profile": "client", "subSortIndex": 10, "protocol": "vless", "port": 10001, "remark": f"{args.server_label} - VLESS WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": address(0), "settings": {"clients": [{**common, "id": client.client_id}], "decryption": "none", "fallbacks": []}, "streamSettings": ws("/vless-ws", address(0))},
@@ -363,6 +371,76 @@ def configure_inbounds(api: ApiClient, existing: list[dict[str, Any]], specs: li
             api.request("panel/api/inbounds/add", "POST", payload)
 
 
+HOST_GROUP_FIELDS = (
+    "sortOrder", "remark", "serverDescription", "isDisabled", "isHidden", "tags",
+    "alpn", "fingerprint", "overrideSniFromAddress", "keepSniBlank",
+    "pinnedPeerCertSha256", "verifyPeerCertByName", "allowInsecure", "echConfigList",
+    "muxParams", "sockoptParams", "finalMask", "vlessRoute", "excludeFromSubTypes",
+    "nodeGuids", "mihomoIpVersion", "mihomoX25519", "shuffleHost",
+)
+
+
+def build_host_payload(
+    spec: dict[str, Any],
+    inbound_id: int,
+    existing_group: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    proxy = spec["streamSettings"]["externalProxy"][0]
+    payload = {
+        key: existing_group[key]
+        for key in HOST_GROUP_FIELDS
+        if existing_group is not None and key in existing_group
+    }
+    payload.update({
+        "inboundIds": [inbound_id],
+        "hosts": [str(proxy["dest"])],
+        "remark": str(payload.get("remark") or f"BDS managed {spec['remark']}"),
+        "port": int(proxy["port"]),
+        "security": str(proxy.get("forceTls") or "same"),
+        "sni": str(proxy.get("sni") or ""),
+        "hostHeader": "",
+        "path": "",
+        "isDisabled": False,
+        "overrideSniFromAddress": False,
+        "keepSniBlank": False,
+    })
+    return payload
+
+
+def configure_hosts(api: ApiClient, inbounds: list[dict[str, Any]], specs: list[dict[str, Any]]) -> None:
+    inbound_by_port = {
+        int(item.get("port")): item
+        for item in inbounds
+        if isinstance(item, dict) and item.get("id") is not None and item.get("port") is not None
+    }
+    groups = api.request("panel/api/hosts/list").get("obj") or []
+    if not isinstance(groups, list):
+        raise RuntimeError("Unexpected host list response")
+
+    for spec in specs:
+        inbound = inbound_by_port.get(int(spec["port"]))
+        if inbound is None:
+            raise RuntimeError(f"Configured inbound port {spec['port']} was not returned by 3x-UI")
+        inbound_id = int(inbound["id"])
+        desired_address = str(spec["streamSettings"]["externalProxy"][0]["dest"])
+        candidates = [
+            group for group in groups
+            if isinstance(group, dict) and inbound_id in [int(value) for value in group.get("inboundIds", [])]
+        ]
+        existing_group = next(
+            (group for group in candidates if desired_address in [str(value) for value in group.get("hosts", [])]),
+            candidates[0] if len(candidates) == 1 else None,
+        )
+        payload = build_host_payload(spec, inbound_id, existing_group)
+        group_id = str(existing_group.get("groupId", "")) if existing_group else ""
+        if group_id:
+            api.request(f"panel/api/hosts/update/{group_id}", "POST", payload)
+        else:
+            created = api.request("panel/api/hosts/add", "POST", payload).get("obj") or []
+            if isinstance(created, list):
+                groups.extend(value for value in created if isinstance(value, dict))
+
+
 def disable_retired_inbounds(api: ApiClient, existing: list[dict[str, Any]], retired_ports: set[int]) -> None:
     for item in existing:
         if not isinstance(item, dict) or int(item.get("port", 0)) not in retired_ports or item.get("enable") is False:
@@ -395,6 +473,10 @@ def main() -> int:
         return 0
     configure_settings(api, args)
     configure_inbounds(api, existing, specs, profiles)
+    refreshed = api.request("panel/api/inbounds/list").get("obj") or []
+    if not isinstance(refreshed, list):
+        raise RuntimeError("Unexpected inbound list response after configuration")
+    configure_hosts(api, refreshed, specs)
     disable_retired_inbounds(api, existing, retired_ports)
     save_profiles(profiles_file, profiles, f"https://{args.sub_domain}/{args.sub_path.strip('/')}/", args.server_label)
     print(f"Configured one unified {args.server_label} client across {len(specs)} supported BDS inbounds. Profile: {profiles_file}")
