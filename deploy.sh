@@ -214,11 +214,11 @@ configure_panel_runtime() {
         -username "${panel_username}" \
         -password "${panel_password}" \
         -port "${XUI_PANEL_PORT}" \
-        -webBasePath "/"
+        -webBasePath "/${XUI_WEB_BASE_PATH}/"
     systemctl restart x-ui
     for _ in $(seq 1 30); do
-        curl --silent --max-time 2 \
-            "http://127.0.0.1:${XUI_PANEL_PORT}/login" >/dev/null 2>&1 && return
+        curl --fail --silent --max-time 2 \
+            "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}/" >/dev/null 2>&1 && return
         sleep 1
     done
     die "3x-UI did not become ready after panel configuration."
@@ -252,7 +252,7 @@ install_3xui() {
     XUI_SSL_MODE=none \
     XUI_DB_TYPE=postgres \
     XUI_PANEL_PORT="${XUI_PANEL_PORT}" \
-    XUI_WEB_BASE_PATH="/" \
+    XUI_WEB_BASE_PATH="/${XUI_WEB_BASE_PATH}/" \
     XUI_USERNAME="${XUI_USERNAME}" \
     XUI_PASSWORD="${XUI_PASSWORD}" \
     bash "${install_script}" "${XUI_VERSION}"
@@ -265,7 +265,7 @@ configure_3xui() {
         outline_args+=(--disable-outline-direct)
     fi
     python3 "${SCRIPT_DIR}/scripts/04_configure_3xui_db.py" \
-        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}" \
         --server-label "${SERVER_LABEL}" \
         --sub-domain "${SUB_DOMAIN}" \
         --sub-port "${XUI_SUB_PORT}" \
@@ -279,7 +279,7 @@ configure_3xui() {
     local warp_ports="10001,10002,10003"
     [[ "${DEPLOYMENT_PROFILE}" == "full" ]] || warp_ports="10001"
     python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
-        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}" \
         --required-ports "${warp_ports}"
 }
 
@@ -342,7 +342,7 @@ verify() {
     local warp_ports="10001,10002,10003"
     [[ "${DEPLOYMENT_PROFILE}" == "full" ]] || warp_ports="10001"
     python3 "${SCRIPT_DIR}/scripts/03_setup_warp.py" \
-        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}" \
+        --panel-url "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}" \
         --required-ports "${warp_ports}" \
         --verify-only
     log "All local smoke tests passed."

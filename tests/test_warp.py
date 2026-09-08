@@ -51,8 +51,8 @@ class WarpProvisioningTests(unittest.TestCase):
     def test_panel_public_prefix_is_preserved_for_authenticated_routes(self) -> None:
         deploy = (ROOT / "deploy.sh").read_text(encoding="utf-8")
         nginx = (ROOT / "config" / "nginx" / "bds-node.conf").read_text(encoding="utf-8")
-        self.assertIn('-webBasePath "/"', deploy)
-        self.assertIn('--panel-url "http://127.0.0.1:${XUI_PANEL_PORT}"', deploy)
+        self.assertIn('-webBasePath "/${XUI_WEB_BASE_PATH}/"', deploy)
+        self.assertIn('--panel-url "http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}"', deploy)
         self.assertIn('location /{{XUI_WEB_BASE_PATH}}/', nginx)
         self.assertIn('proxy_pass http://127.0.0.1:{{XUI_PANEL_PORT}};', nginx)
 
