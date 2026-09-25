@@ -18,13 +18,14 @@ def repair_json(value: object) -> None:
     if not isinstance(value, dict):
         return
     stream = value.get("streamSettings")
-    if value.get("protocol") == "vless" and isinstance(stream, dict) and stream.get("security") == "reality":
-        reality = stream.get("realitySettings")
-        if isinstance(reality, dict):
-            reality.pop("serverNames", None)
+    if value.get("protocol") == "vless":
         settings = value.setdefault("settings", {})
         if isinstance(settings, dict) and not settings.get("encryption"):
             settings["encryption"] = "none"
+        if isinstance(stream, dict) and stream.get("security") == "reality":
+            reality = stream.get("realitySettings")
+            if isinstance(reality, dict):
+                reality.pop("serverNames", None)
     for item in value.values():
         repair_json(item)
 

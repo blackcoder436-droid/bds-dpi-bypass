@@ -29,6 +29,11 @@ class SubscriptionSanitizerTests(unittest.TestCase):
         sanitizer.repair_json(payload)
         self.assertEqual(payload, expected)
 
+    def test_repairs_empty_encryption_on_ws_vless_outbound(self) -> None:
+        payload = {"protocol": "vless", "settings": {"encryption": ""}, "streamSettings": {"security": "tls", "network": "ws"}}
+        sanitizer.repair_json(payload)
+        self.assertEqual(payload["settings"]["encryption"], "none")
+
 
 if __name__ == "__main__":
     unittest.main()
