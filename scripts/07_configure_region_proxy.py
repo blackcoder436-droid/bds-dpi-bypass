@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,24 @@ def nginx_location(path: str, port: int) -> str:
     proxy_send_timeout 86400s;
 }}
 """
+
+
+def template_has_tag(value: object, tag: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(isinstance(item, dict) and item.get("tag") == tag for item in value.get("outbounds", [])) and any(
+        isinstance(item, dict) and item.get("outboundTag") == tag
+        for item in (value.get("routing") or {}).get("rules", [])
+    )
+
+
+def persist_postgres_template(dsn: str, template: dict[str, Any]) -> None:
+    serialized = json.dumps(template, separators=(",", ":"))
+    delimiter = "$bds_region$"
+    if delimiter in serialized:
+        raise RuntimeError("Unexpected PostgreSQL delimiter in Xray template")
+    sql = f"UPDATE settings SET value={delimiter}{serialized}{delimiter} WHERE key='xrayTemplateConfig';\n"
+    subprocess.run(["psql", dsn, "-v", "ON_ERROR_STOP=1"], input=sql, text=True, check=True, stdout=subprocess.DEVNULL)
 
 
 def parse_args() -> argparse.Namespace:
@@ -132,6 +151,20 @@ def main() -> int:
     route_file.write_text(nginx_location(args.path, args.inbound_port), encoding="utf-8")
     subprocess.run(["nginx", "-t"], check=True)
     subprocess.run(["systemctl", "reload", "nginx"], check=True)
+    persisted = api.request("panel/api/setting/all", "POST").get("obj") or {}
+    persisted_template = core.json_field(persisted.get("xrayTemplateConfig"), {})
+    if not template_has_tag(persisted_template, tag):
+        dsn = os.environ.get("XUI_DB_DSN", "")
+        if not dsn:
+            raise RuntimeError("3x-UI did not persist xrayTemplateConfig and XUI_DB_DSN is unavailable for the PostgreSQL fallback")
+        persist_postgres_template(dsn, template)
+        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+        for _ in range(30):
+            if subprocess.run(["systemctl", "is-active", "--quiet", "x-ui"]).returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("x-ui did not become active after the Xray template update")
     print(f"Configured {args.region_code.upper()} region for {len(clients)} clients. Proxy credentials were not printed.")
     return 0
 

@@ -29,6 +29,12 @@ class RegionProxyTests(unittest.TestCase):
         self.assertIn("location = /jp-vless-ws", value)
         self.assertIn("proxy_pass http://127.0.0.1:10006;", value)
 
+    def test_template_tag_check_requires_outbound_and_rule(self) -> None:
+        template = {"outbounds": [{"tag": "BDS-REGION-TH"}], "routing": {"rules": []}}
+        self.assertFalse(region.template_has_tag(template, "BDS-REGION-TH"))
+        template["routing"]["rules"].append({"outboundTag": "BDS-REGION-TH"})
+        self.assertTrue(region.template_has_tag(template, "BDS-REGION-TH"))
+
 
 if __name__ == "__main__":
     unittest.main()
