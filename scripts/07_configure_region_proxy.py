@@ -112,6 +112,15 @@ def main() -> int:
         api.request(f"panel/api/inbounds/update/{current['id']}", "POST", payload)
     else:
         api.request("panel/api/inbounds/add", "POST", payload)
+    # Some 3x-UI releases omit auto-detect fields from setting/all and then
+    # reset them to defaults during setting/update. Re-assert the client
+    # compatibility contract whenever the Xray template is saved.
+    settings.update({
+        "subJsonEnable": True,
+        "subJsonAutoDetect": True,
+        "subJsonUserAgentRegex": "(?i)hiddify",
+        "subJsonPath": "/json/",
+    })
     settings["xrayTemplateConfig"] = json.dumps(template, separators=(",", ":"))
     api.request("panel/api/setting/update", "POST", settings)
     refreshed = api.request("panel/api/inbounds/list").get("obj") or []
