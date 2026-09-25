@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Add or update one CDN VLESS inbound routed through a regional SOCKS5 proxy."""
+from __future__ import annotations
+import argparse
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def load_core():
+    candidates = [Path(__file__).with_name("04_configure_3xui_db.py"), Path("/usr/local/libexec/bds-configure-3xui.py")]
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if path is None:
+        raise RuntimeError("bds-configure-3xui.py is not installed")
+    spec = importlib.util.spec_from_file_location("bds_configure_3xui", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def region_tag(code: str) -> str:
+    return f"BDS-REGION-{code.upper()}"
+
+
+def update_template(template: dict[str, Any], *, tag: str, inbound_port: int, proxy_host: str, proxy_port: int, proxy_user: str, proxy_password: str) -> dict[str, Any]:
+    outbounds = template.setdefault("outbounds", [])
+    routing = template.setdefault("routing", {})
+    rules = routing.setdefault("rules", [])
+    outbound = {"tag": tag, "protocol": "socks", "settings": {"servers": [{"address": proxy_host, "port": proxy_port, "users": [{"user": proxy_user, "pass": proxy_password}]}]}}
+    outbounds[:] = [item for item in outbounds if not isinstance(item, dict) or item.get("tag") != tag]
+    outbounds.append(outbound)
+    rule = {"type": "field", "inboundTag": [f"in-{inbound_port}-tcp"], "outboundTag": tag}
+    rules[:] = [item for item in rules if not isinstance(item, dict) or item.get("outboundTag") != tag]
+    rules.insert(0, rule)
+    return template
+
+
+def nginx_location(path: str, port: int) -> str:
+    return f"""location = {path} {{
+    proxy_pass http://127.0.0.1:{port};
+    include /etc/nginx/proxy_params;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+}}
+"""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--panel-url", required=True)
+    parser.add_argument("--username", default=os.environ.get("XUI_USERNAME"))
+    parser.add_argument("--password", default=os.environ.get("XUI_PASSWORD"))
+    parser.add_argument("--region-code", required=True)
+    parser.add_argument("--region-name", required=True)
+    parser.add_argument("--cdn-domain", required=True)
+    parser.add_argument("--inbound-port", required=True, type=int)
+    parser.add_argument("--path", required=True)
+    parser.add_argument("--proxy-host", default=os.environ.get("REGION_PROXY_HOST"))
+    parser.add_argument("--proxy-port", type=int, default=int(os.environ.get("REGION_PROXY_PORT", "0")))
+    parser.add_argument("--proxy-user", default=os.environ.get("REGION_PROXY_USER"))
+    parser.add_argument("--proxy-password", default=os.environ.get("REGION_PROXY_PASSWORD"))
+    parser.add_argument("--source-port", type=int, default=10001)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not re.fullmatch(r"[A-Za-z]{2,8}", args.region_code):
+        raise RuntimeError("REGION_CODE must be 2-8 letters")
+    if not re.fullmatch(r"/[A-Za-z0-9/_-]{2,80}", args.path):
+        raise RuntimeError("PATH must be an absolute safe WebSocket path")
+    if not (1024 <= args.inbound_port <= 65535) or not (1 <= args.proxy_port <= 65535):
+        raise RuntimeError("Invalid inbound or proxy port")
+    required = (args.username, args.password, args.proxy_host, args.proxy_user, args.proxy_password)
+    if not all(required):
+        raise RuntimeError("Panel and REGION_PROXY_* credentials are required")
+    core = load_core()
+    api = core.ApiClient(args.panel_url, args.username, args.password)
+    api.login()
+    existing = api.request("panel/api/inbounds/list").get("obj") or []
+    source = next((item for item in existing if int(item.get("port", 0)) == args.source_port), None)
+    if not source:
+        raise RuntimeError(f"Source inbound port {args.source_port} was not found")
+    source_settings = core.json_field(source.get("settings"), {})
+    clients = source_settings.get("clients")
+    if not isinstance(clients, list) or not clients:
+        raise RuntimeError("Source inbound has no clients to attach")
+    tag = region_tag(args.region_code)
+    settings = api.request("panel/api/setting/all", "POST").get("obj") or {}
+    template = core.json_field(settings.get("xrayTemplateConfig"), {})
+    update_template(template, tag=tag, inbound_port=args.inbound_port, proxy_host=args.proxy_host, proxy_port=args.proxy_port, proxy_user=args.proxy_user, proxy_password=args.proxy_password)
+    if args.dry_run:
+        print(f"Dry run passed: {args.region_code.upper()} will attach {len(clients)} clients on {args.inbound_port} via {tag}.")
+        return 0
+    stream = {"network": "ws", "security": "none", "externalProxy": core.external_proxy(args.cdn_domain, 443, True, sni=args.cdn_domain), "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": args.path, "headers": {"Host": args.cdn_domain}}}
+    payload = {"enable": True, "remark": f"{args.region_code.upper()}1 - VLESS WS CDN", "listen": "127.0.0.1", "port": args.inbound_port, "protocol": "vless", "settings": {"clients": clients, "decryption": "none", "fallbacks": []}, "streamSettings": stream, "sniffing": core.sniffing(), "expiryTime": 0, "total": 0, "trafficReset": "never", "subSortIndex": 100}
+    current = next((item for item in existing if int(item.get("port", 0)) == args.inbound_port), None)
+    if current:
+        payload["id"] = current["id"]
+        api.request(f"panel/api/inbounds/update/{current['id']}", "POST", payload)
+    else:
+        api.request("panel/api/inbounds/add", "POST", payload)
+    settings["xrayTemplateConfig"] = json.dumps(template, separators=(",", ":"))
+    api.request("panel/api/setting/update", "POST", settings)
+    refreshed = api.request("panel/api/inbounds/list").get("obj") or []
+    spec = {**payload, "streamSettings": stream}
+    core.configure_hosts(api, refreshed, [spec])
+    route_dir = Path("/etc/nginx/bds-region-routes.d")
+    route_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    route_file = route_dir / f"{args.region_code.lower()}.conf"
+    route_file.write_text(nginx_location(args.path, args.inbound_port), encoding="utf-8")
+    subprocess.run(["nginx", "-t"], check=True)
+    subprocess.run(["systemctl", "reload", "nginx"], check=True)
+    print(f"Configured {args.region_code.upper()} region for {len(clients)} clients. Proxy credentials were not printed.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

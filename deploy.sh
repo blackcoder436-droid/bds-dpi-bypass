@@ -31,8 +31,8 @@ load_config() {
     : "${DIRECT_DOMAIN:?DIRECT_DOMAIN is required}"
 
     SERVER_LABEL="${SERVER_LABEL:-SG1}"
-    XUI_VERSION="${XUI_VERSION:-v3.6.0}"
-    XUI_INSTALL_SHA256="${XUI_INSTALL_SHA256:-7bb41e811f2107a3182da9090f24893d3612b5b6310194a7dd1f9965ff29e0c8}"
+    XUI_VERSION="${XUI_VERSION:-v3.8.5}"
+    XUI_INSTALL_SHA256="${XUI_INSTALL_SHA256:-4e3fe7fe00ef8e904ce6a0e9c36fd8a0c7179fe5e786f23e31801aee84c6347d}"
     XUI_PANEL_PORT="${XUI_PANEL_PORT:-2053}"
     XUI_SUB_PORT="${XUI_SUB_PORT:-2096}"
     XUI_WEB_BASE_PATH="${XUI_WEB_BASE_PATH:-panel}"
@@ -103,7 +103,7 @@ backup_state() {
     install -d -m 700 "${backup_dir}"
 
     tar --xattrs --acls -C / -cf "${backup_dir}/filesystem.tar" --files-from /dev/null
-    for path in /etc/nginx /etc/x-ui /etc/default/x-ui /etc/systemd/system/x-ui.service /etc/bds-dpi-bypass /usr/local/sbin/bds-dpi-show-subscriptions; do
+    for path in /etc/nginx /etc/x-ui /etc/default/x-ui /etc/systemd/system/x-ui.service /etc/systemd/system/xui-subscription-sanitizer.service /etc/bds-dpi-bypass /usr/local/libexec/xui-subscription-sanitizer.py /usr/local/sbin/bds-dpi-show-subscriptions; do
         [[ -e "${path}" ]] && tar --xattrs --acls -C / -rf "${backup_dir}/filesystem.tar" "${path#/}"
     done
     gzip -f "${backup_dir}/filesystem.tar"
@@ -286,6 +286,19 @@ configure_3xui() {
 install_operator_tools() {
     install -m 755 "${SCRIPT_DIR}/scripts/05_show_subscriptions.py" /usr/local/sbin/bds-dpi-show-subscriptions
     install -m 755 "${SCRIPT_DIR}/scripts/03_setup_warp.py" /usr/local/sbin/bds-dpi-verify-warp
+    install -m 755 "${SCRIPT_DIR}/scripts/04_configure_3xui_db.py" /usr/local/libexec/bds-configure-3xui.py
+    install -m 755 "${SCRIPT_DIR}/scripts/07_configure_region_proxy.py" /usr/local/sbin/bds-dpi-configure-region
+}
+
+install_subscription_sanitizer() {
+    local unit_source unit_target
+    unit_source="${SCRIPT_DIR}/config/systemd/xui-subscription-sanitizer.service"
+    unit_target="/etc/systemd/system/xui-subscription-sanitizer.service"
+    install -d -m 755 /usr/local/libexec
+    install -m 755 "${SCRIPT_DIR}/scripts/06_subscription_sanitizer.py" /usr/local/libexec/xui-subscription-sanitizer.py
+    sed "s/{{XUI_SUB_PORT}}/${XUI_SUB_PORT}/g" "${unit_source}" > "${unit_target}"
+    systemctl daemon-reload
+    systemctl enable --now xui-subscription-sanitizer
 }
 
 configure_fail2ban() {
@@ -319,6 +332,7 @@ verify() {
     systemctl is-active --quiet postgresql || die "PostgreSQL is not active."
     systemctl is-active --quiet x-ui || die "3x-UI is not active."
     systemctl is-active --quiet nginx || die "Nginx is not active."
+    systemctl is-active --quiet xui-subscription-sanitizer || die "Subscription sanitizer is not active."
     grep -q '^XUI_DB_TYPE=postgres$' /etc/default/x-ui || die "3x-UI is not configured for PostgreSQL."
     sudo -u postgres psql -d xui -tAc 'SELECT 1' | grep -qx '1' || die "PostgreSQL xui database check failed."
     curl --fail --silent --show-error --max-time 10 \
@@ -361,6 +375,7 @@ main() {
     ensure_postgres_backend
     configure_panel_runtime
     configure_3xui
+    install_subscription_sanitizer
     configure_network
     install_operator_tools
     verify

@@ -16,6 +16,9 @@ ENABLED="/etc/nginx/sites-enabled/bds-dpi-bypass"
 : "${TLS_CERT_FILE:?TLS_CERT_FILE is required}"
 : "${TLS_KEY_FILE:?TLS_KEY_FILE is required}"
 
+install -d -m 755 /etc/nginx/bds-region-routes.d
+touch /etc/nginx/bds-region-routes.d/00-empty.conf
+
 python3 - "${TEMPLATE}" "${TARGET}" <<'PY'
 import os
 import pathlib

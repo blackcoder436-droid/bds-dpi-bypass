@@ -13,7 +13,6 @@ import json
 import os
 import re
 import secrets
-import socket
 import sys
 import tempfile
 import urllib.error
@@ -280,21 +279,15 @@ def external_proxy(
     return [item]
 
 
-def resolve_cdn_ipv4(domain: str) -> list[str]:
-    addresses = sorted({item[4][0] for item in socket.getaddrinfo(domain, 443, socket.AF_INET, socket.SOCK_STREAM)})
-    if not addresses:
-        raise RuntimeError(f"CDN domain has no IPv4 address: {domain}")
-    return addresses
-
-
 def build_specs(args: argparse.Namespace, profiles: dict[str, ProfileValues]) -> list[dict[str, Any]]:
-    cdn_addresses = resolve_cdn_ipv4(args.cdn_domain)
     direct_ss_proxy = external_proxy(args.direct_domain, 10005)
     client = profiles["client"]
     common = {"email": client.email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True, "tgId": 0, "subId": client.sub_id, "reset": 0}
     def ws(path: str, address: str) -> dict[str, Any]:
         return {"network": "ws", "security": "none", "externalProxy": external_proxy(address, 443, True, sni=args.cdn_domain), "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": path, "headers": {"Host": args.cdn_domain}}}
-    address = lambda index: cdn_addresses[index % len(cdn_addresses)]
+    # Keep the hostname in share records so clients retain DNS failover across
+    # Cloudflare anycast addresses instead of pinning one edge indefinitely.
+    address = lambda _index: args.cdn_domain
     specs = [
         {"profile": "client", "subSortIndex": 10, "protocol": "vless", "port": 10001, "remark": f"{args.server_label} - VLESS WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": address(0), "settings": {"clients": [{**common, "id": client.client_id}], "decryption": "none", "fallbacks": []}, "streamSettings": ws("/vless-ws", address(0))},
         {"profile": "client", "subSortIndex": 20, "protocol": "vmess", "port": 10002, "remark": f"{args.server_label} - VMess WS CDN", "listen": "127.0.0.1", "shareAddrStrategy": "custom", "shareAddr": address(1), "settings": {"clients": [{**common, "id": client.client_id, "alterId": 0, "security": "aes-128-gcm"}]}, "streamSettings": ws("/vmess-ws", address(1))},
@@ -317,6 +310,10 @@ def configure_settings(api: ApiClient, args: argparse.Namespace) -> None:
         "subDomain": args.sub_domain,
         "subURI": f"https://{args.sub_domain}/{args.sub_path.strip('/')}/",
         "subEncrypt": True,
+        "subJsonEnable": True,
+        "subJsonAutoDetect": True,
+        "subJsonUserAgentRegex": "(?i)hiddify",
+        "subJsonPath": "/json/",
         "subCertFile": "",
         "subKeyFile": "",
     })

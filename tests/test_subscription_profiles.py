@@ -98,8 +98,7 @@ class SubscriptionProfileTests(unittest.TestCase):
                 disable_outline_direct=False,
                 server_label="SG1",
             )
-            with mock.patch.object(configure, "resolve_cdn_ipv4", return_value=["104.21.1.1", "172.67.1.1"]):
-                specs = configure.build_specs(args, profiles)
+            specs = configure.build_specs(args, profiles)
             self.assertEqual(
                 [spec["remark"] for spec in specs],
                 [
@@ -110,13 +109,13 @@ class SubscriptionProfileTests(unittest.TestCase):
                 ],
             )
             self.assertEqual([spec["subSortIndex"] for spec in specs], [10, 20, 30, 40])
-            self.assertEqual([spec["shareAddr"] for spec in specs[:3]], ["104.21.1.1", "172.67.1.1", "104.21.1.1"])
+            self.assertEqual([spec["shareAddr"] for spec in specs[:3]], ["cdn.example.com"] * 3)
             for spec in specs[:3]:
                 proxy = spec["streamSettings"]["externalProxy"][0]
                 self.assertEqual(
                     proxy,
                     {
-                        "dest": spec["shareAddr"],
+                        "dest": "cdn.example.com",
                         "port": 443,
                         "forceTls": "tls",
                         "sni": "cdn.example.com",
@@ -127,7 +126,7 @@ class SubscriptionProfileTests(unittest.TestCase):
             self.assertEqual(vmess["settings"]["clients"][0]["security"], "aes-128-gcm")
             host_payload = configure.build_host_payload(specs[0], 42)
             self.assertEqual(host_payload["inboundIds"], [42])
-            self.assertEqual(host_payload["hosts"], ["104.21.1.1"])
+            self.assertEqual(host_payload["hosts"], ["cdn.example.com"])
             self.assertEqual(host_payload["security"], "tls")
             self.assertEqual(host_payload["sni"], "cdn.example.com")
             self.assertFalse(host_payload["keepSniBlank"])
@@ -143,8 +142,7 @@ class SubscriptionProfileTests(unittest.TestCase):
                     self.assertIn(self.unrelated["subId"], sub_ids)
 
             args.disable_outline_direct = True
-            with mock.patch.object(configure, "resolve_cdn_ipv4", return_value=["104.21.1.1"]):
-                self.assertEqual([spec["port"] for spec in configure.build_specs(args, profiles)], [10001, 10002, 10003])
+            self.assertEqual([spec["port"] for spec in configure.build_specs(args, profiles)], [10001, 10002, 10003])
 
     def test_retired_inbounds_are_disabled_without_deletion(self) -> None:
         api = mock.MagicMock()

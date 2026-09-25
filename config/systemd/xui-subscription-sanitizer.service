@@ -1,0 +1,18 @@
+[Unit]
+Description=Sanitize 3x-UI JSON subscriptions for Xray clients
+After=network.target x-ui.service
+Requires=x-ui.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/xui-subscription-sanitizer.py --upstream http://127.0.0.1:{{XUI_SUB_PORT}}
+Restart=always
+RestartSec=2
+User=nobody
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

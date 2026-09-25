@@ -30,6 +30,13 @@ class NginxTemplateTests(unittest.TestCase):
         self.assertIn("location = / {", template)
         self.assertIn("return 302 /{{XUI_WEB_BASE_PATH}}/;", template)
 
+    def test_subscription_uses_json_sanitizer_and_ss_route_exists(self) -> None:
+        template = (ROOT / "config" / "nginx" / "bds-node.conf").read_text(encoding="utf-8")
+        self.assertIn("proxy_pass http://127.0.0.1:2097;", template)
+        self.assertIn("location /ss-ws {", template)
+        self.assertIn("proxy_pass http://127.0.0.1:10004;", template)
+        self.assertIn("include /etc/nginx/bds-region-routes.d/*.conf;", template)
+
 
 if __name__ == "__main__":
     unittest.main()
