@@ -35,6 +35,23 @@ class RegionProxyTests(unittest.TestCase):
         template["routing"]["rules"].append({"outboundTag": "BDS-REGION-TH"})
         self.assertTrue(region.template_has_tag(template, "BDS-REGION-TH"))
 
+    def test_canonical_node_code_uses_panel_suffix(self) -> None:
+        self.assertEqual(region.canonical_node_code("jp", "SG1"), "JP1")
+        self.assertEqual(region.canonical_node_code("th", "SG3"), "TH3")
+        self.assertEqual(region.canonical_node_code("jp", "SG3", "JP3"), "JP3")
+        with self.assertRaises(RuntimeError):
+            region.canonical_node_code("jp", "Singapore")
+
+    def test_http_proxy_maps_to_xray_http_outbound(self) -> None:
+        template = {"outbounds": [], "routing": {"rules": []}}
+        region.update_template(template, tag="BDS-REGION-JP1", inbound_port=10006, proxy_protocol="http", proxy_host="proxy.example", proxy_port=8080, proxy_user="user", proxy_password="secret")
+        self.assertEqual(template["outbounds"][0]["protocol"], "http")
+
+    def test_proxy_auth_is_optional(self) -> None:
+        template = {"outbounds": [], "routing": {"rules": []}}
+        region.update_template(template, tag="BDS-REGION-JP", inbound_port=10006, proxy_host="proxy.example", proxy_port=1080, proxy_user="", proxy_password="")
+        self.assertNotIn("users", template["outbounds"][0]["settings"]["servers"][0])
+
 
 if __name__ == "__main__":
     unittest.main()
