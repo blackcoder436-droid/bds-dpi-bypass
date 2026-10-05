@@ -6,6 +6,8 @@ import importlib.util
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -70,6 +72,65 @@ def template_has_tag(value: object, tag: str) -> bool:
     )
 
 
+def check_proxy_tunnel(protocol: str, proxy_host: str, proxy_port: int, proxy_user: str, proxy_password: str, target_host: str, target_port: int, timeout: float = 8.0) -> None:
+    """Verify that the regional proxy can open a TCP tunnel without printing credentials."""
+    def receive_exact(connection: socket.socket, size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = connection.recv(size - len(chunks))
+            if not chunk:
+                raise RuntimeError("Proxy closed the connection during negotiation")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    with socket.create_connection((proxy_host, proxy_port), timeout=timeout) as connection:
+        connection.settimeout(timeout)
+        if protocol == "http":
+            headers = [f"CONNECT {target_host}:{target_port} HTTP/1.1", f"Host: {target_host}:{target_port}"]
+            if proxy_user:
+                import base64
+                token = base64.b64encode(f"{proxy_user}:{proxy_password}".encode()).decode()
+                headers.append(f"Proxy-Authorization: Basic {token}")
+            connection.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+            response = bytearray()
+            while b"\r\n\r\n" not in response and len(response) < 8192:
+                chunk = connection.recv(1024)
+                if not chunk:
+                    break
+                response.extend(chunk)
+            if b"\r\n\r\n" not in response or not re.match(br"HTTP/\d(?:\.\d)? 2\d\d(?: |$)", bytes(response).split(b"\r\n", 1)[0]):
+                raise RuntimeError("HTTP proxy CONNECT check failed")
+            return
+
+        methods = b"\x00\x02" if proxy_user else b"\x00"
+        connection.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        reply = receive_exact(connection, 2)
+        if reply[0] != 5 or reply[1] == 0xFF:
+            raise RuntimeError("SOCKS5 negotiation failed")
+        if reply[1] == 2:
+            user, password = proxy_user.encode(), proxy_password.encode()
+            if len(user) > 255 or len(password) > 255:
+                raise RuntimeError("SOCKS5 credentials are too long")
+            connection.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(password)]) + password)
+            if receive_exact(connection, 2) != b"\x01\x00":
+                raise RuntimeError("SOCKS5 authentication failed")
+        host = target_host.encode()
+        if len(host) > 255:
+            raise RuntimeError("Health target hostname is too long")
+        connection.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack("!H", target_port))
+        reply = receive_exact(connection, 4)
+        if reply[1] != 0:
+            raise RuntimeError("SOCKS5 proxy tunnel check failed")
+        if reply[3] == 0x01:
+            receive_exact(connection, 6)
+        elif reply[3] == 0x04:
+            receive_exact(connection, 18)
+        elif reply[3] == 0x03:
+            receive_exact(connection, receive_exact(connection, 1)[0] + 2)
+        else:
+            raise RuntimeError("SOCKS5 proxy returned an invalid address type")
+
+
 def persist_postgres_template(dsn: str, template: dict[str, Any]) -> None:
     serialized = json.dumps(template, separators=(",", ":"))
     delimiter = "$bds_region$"
@@ -97,6 +158,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proxy-user", default=os.environ.get("REGION_PROXY_USER"))
     parser.add_argument("--proxy-password", default=os.environ.get("REGION_PROXY_PASSWORD"))
     parser.add_argument("--source-port", type=int, default=10001)
+    parser.add_argument("--health-host", default=os.environ.get("REGION_HEALTH_HOST", "api.ipify.org"))
+    parser.add_argument("--health-port", type=int, default=int(os.environ.get("REGION_HEALTH_PORT", "443")))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--json", action="store_true")
@@ -142,7 +205,7 @@ def main() -> int:
     if args.dry_run and args.verify_only:
         raise RuntimeError("DRY_RUN and VERIFY_ONLY are mutually exclusive")
     node_code = canonical_node_code(args.region_code, args.server_label, args.node_code)
-    required = (args.username, args.password) if args.verify_only else (args.username, args.password, args.proxy_host)
+    required = (args.username, args.password, args.proxy_host)
     if not all(required):
         raise RuntimeError("Panel and REGION_PROXY_* credentials are required")
     if bool(args.proxy_user) != bool(args.proxy_password):
@@ -155,10 +218,16 @@ def main() -> int:
         state = verification_state(api, inbound_port=args.inbound_port, node_code=node_code, region_code=args.region_code, tag=tag, path=args.path)
         if not all(state.values()):
             raise RuntimeError("Region verification failed: " + ", ".join(key for key, value in state.items() if not value))
+        check_proxy_tunnel(args.proxy_protocol, args.proxy_host, args.proxy_port, args.proxy_user, args.proxy_password, args.health_host, args.health_port)
+        state["proxy"] = True
         result = {"status": "verified", "nodeCode": node_code, "inboundPort": args.inbound_port, "checks": state}
         print(json.dumps(result, separators=(",", ":")) if args.json else f"Verified {node_code}: inbound, routing, and Nginx route are active.")
         return 0
     existing = api.request("panel/api/inbounds/list").get("obj") or []
+    current = next((item for item in existing if int(item.get("port", 0)) == args.inbound_port), None)
+    expected_remark = f"{node_code} - VLESS WS CDN"
+    if current and str(current.get("remark", "")).strip() != expected_remark:
+        raise RuntimeError(f"Inbound port {args.inbound_port} is already used by another panel inbound")
     source = next((item for item in existing if int(item.get("port", 0)) == args.source_port), None)
     if not source:
         raise RuntimeError(f"Source inbound port {args.source_port} was not found")
@@ -169,13 +238,13 @@ def main() -> int:
     settings = api.request("panel/api/setting/all", "POST").get("obj") or {}
     template = core.json_field(settings.get("xrayTemplateConfig"), {})
     update_template(template, tag=tag, inbound_port=args.inbound_port, proxy_protocol=args.proxy_protocol, proxy_host=args.proxy_host, proxy_port=args.proxy_port, proxy_user=args.proxy_user, proxy_password=args.proxy_password)
+    check_proxy_tunnel(args.proxy_protocol, args.proxy_host, args.proxy_port, args.proxy_user, args.proxy_password, args.health_host, args.health_port)
     if args.dry_run:
         result = {"status": "dry_run", "nodeCode": node_code, "clients": len(clients), "inboundPort": args.inbound_port, "outboundTag": tag}
         print(json.dumps(result, separators=(",", ":")) if args.json else f"Dry run passed: {node_code} will attach {len(clients)} clients on {args.inbound_port} via {tag}.")
         return 0
     stream = {"network": "ws", "security": "none", "externalProxy": core.external_proxy(args.cdn_domain, 443, True, sni=args.cdn_domain), "wsSettings": {"acceptProxyProtocol": False, "host": args.cdn_domain, "path": args.path, "headers": {"Host": args.cdn_domain}}}
     payload = {"enable": True, "remark": f"{node_code} - VLESS WS CDN", "listen": "127.0.0.1", "port": args.inbound_port, "protocol": "vless", "settings": {"clients": clients, "decryption": "none", "fallbacks": []}, "streamSettings": stream, "sniffing": core.sniffing(), "expiryTime": 0, "total": 0, "trafficReset": "never", "subSortIndex": 100}
-    current = next((item for item in existing if int(item.get("port", 0)) == args.inbound_port), None)
     if current:
         payload["id"] = current["id"]
         api.request(f"panel/api/inbounds/update/{current['id']}", "POST", payload)
