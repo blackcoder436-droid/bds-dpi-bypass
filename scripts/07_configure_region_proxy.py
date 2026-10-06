@@ -312,7 +312,8 @@ def main() -> int:
             raise RuntimeError("x-ui did not become active after the Xray template update")
     state = verification_state(api, inbound_port=args.inbound_port, node_code=node_code, region_code=args.region_code, tag=tag, path=args.path)
     if not all(state.values()):
-        raise RuntimeError("Post-apply region verification failed")
+        failed_checks = ", ".join(key for key, value in state.items() if not value)
+        raise RuntimeError(f"Post-apply region verification failed: {failed_checks}")
     result = {"status": "configured", "nodeCode": node_code, "clients": len(clients), "inboundPort": args.inbound_port, "checks": state}
     print(json.dumps(result, separators=(",", ":")) if args.json else f"Configured {node_code} region for {len(clients)} clients. Proxy credentials were not printed.")
     return 0
