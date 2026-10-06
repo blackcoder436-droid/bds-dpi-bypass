@@ -90,6 +90,59 @@ class RegionProxyTests(unittest.TestCase):
         self.assertIn("location = /jp-vless-ws", value)
         self.assertIn("proxy_pass http://127.0.0.1:10006;", value)
 
+    def test_region_route_include_is_added_only_to_matching_https_cdn_vhost(self) -> None:
+        config = """server {
+    listen 80;
+    server_name cdn.example;
+}
+
+server {
+    listen 443 ssl;
+    server_name panel.example;
+}
+
+server {
+    listen 443 ssl;
+    server_name cdn.example;
+    location / { return 404; }
+}
+"""
+        updated, changed = region.add_region_route_include(config, "cdn.example")
+        self.assertTrue(changed)
+        self.assertEqual(updated.count(region.NGINX_REGION_INCLUDE), 1)
+        self.assertIn("server_name panel.example;\n}\n\nserver {\n    listen 443 ssl;\n    server_name cdn.example;\n    location / { return 404; }\n\n    include", updated)
+        unchanged, changed_again = region.add_region_route_include(updated, "cdn.example")
+        self.assertFalse(changed_again)
+        self.assertEqual(unchanged, updated)
+
+    def test_nginx_cdn_server_must_be_unique_and_tls_enabled(self) -> None:
+        plain_http = "server {\n    listen 80;\n    server_name cdn.example;\n}\n"
+        with self.assertRaisesRegex(RuntimeError, "found 0"):
+            region.cdn_server_block(plain_http, "cdn.example")
+
+        duplicate = """server {
+    listen 443 ssl;
+    server_name cdn.example;
+}
+server {
+    listen 443 ssl;
+    server_name cdn.example;
+}
+"""
+        with self.assertRaisesRegex(RuntimeError, "found 2"):
+            region.cdn_server_block(duplicate, "cdn.example")
+
+    def test_nginx_server_block_parser_ignores_braces_in_comments_and_strings(self) -> None:
+        config = '''server {
+    listen 443 ssl;
+    server_name cdn.example;
+    # } this brace is a comment
+    add_header X-Test "{still a string}";
+}
+'''
+        block, _, _ = region.cdn_server_block(config, "cdn.example")
+        self.assertIn('add_header X-Test "{still a string}";', block)
+
     def test_template_tag_check_requires_outbound_and_rule(self) -> None:
         template = {"outbounds": [{"tag": "BDS-REGION-TH"}], "routing": {"rules": []}}
         self.assertFalse(region.template_has_tag(template, "BDS-REGION-TH"))

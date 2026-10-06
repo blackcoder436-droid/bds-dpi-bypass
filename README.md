@@ -69,8 +69,10 @@ Each node has one client subscription containing VLESS WS CDN, VMess WS CDN, Tro
 Regional proxy routes are managed idempotently with `bds-dpi-configure-region`. Pass
 `--server-label SG3 --region-code JP` (or the explicit `--node-code JP3`) so subscription remarks
 remain canonical on every panel. `--dry-run --json` validates the source inbound and proposed
-route without mutation; `--verify-only --json` checks the inbound, Xray routing rule, and Nginx
-WebSocket route after apply. Proxy credentials are accepted through `REGION_PROXY_*` environment
+route without mutation; apply repairs the CDN HTTPS vhost's dynamic route include when needed.
+`--verify-only --json` checks the inbound, Xray routing rule, proxy tunnel, and a live local TLS
+WebSocket upgrade through Nginx (HTTP 101), so a route file that is present but not loaded cannot
+be reported as healthy. Proxy credentials are accepted through `REGION_PROXY_*` environment
 variables and are never printed.
 
 Direct entries may reveal the VPS IP, may be selected by Hiddify auto-balancing, and may be blocked by the user's ISP. Generated subscription credentials are stored only in the root-readable file configured by `SUB_PROFILE_FILE`; they are never committed to this repository. On the VPS, display the single link with:

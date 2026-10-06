@@ -7,9 +7,11 @@ import json
 import os
 import re
 import socket
+import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -113,6 +115,170 @@ def nginx_location(path: str, port: int) -> str:
     proxy_send_timeout 86400s;
 }}
 """
+
+
+NGINX_REGION_INCLUDE = "/etc/nginx/bds-region-routes.d/*.conf"
+
+
+def _matching_brace(text: str, opening: int) -> int:
+    depth = 0
+    quote = ""
+    escaped = False
+    comment = False
+    for index in range(opening, len(text)):
+        char = text[index]
+        if comment:
+            if char == "\n":
+                comment = False
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char == "#":
+            comment = True
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise RuntimeError("Unbalanced braces in Nginx configuration")
+
+
+def nginx_server_blocks(config: str) -> list[tuple[str, int, int]]:
+    """Return server blocks and their source offsets, ignoring braces in comments/strings."""
+    result = []
+    for match in re.finditer(r"(?m)^[ \t]*server\s*\{", config):
+        opening = config.find("{", match.start(), match.end())
+        closing = _matching_brace(config, opening)
+        result.append((config[match.start():closing + 1], match.start(), closing + 1))
+    return result
+
+
+def is_cdn_tls_server(block: str, cdn_domain: str) -> bool:
+    names = re.findall(r"(?m)^\s*server_name\s+([^;]+);", block)
+    if not any(cdn_domain in value.split() for value in names):
+        return False
+    for value in re.findall(r"(?m)^\s*listen\s+([^;]+);", block):
+        parts = value.split()
+        if parts and parts[0].rsplit(":", 1)[-1] == "443" and "ssl" in parts[1:]:
+            return True
+    return False
+
+
+def cdn_server_block(config: str, cdn_domain: str) -> tuple[str, int, int]:
+    matches = [item for item in nginx_server_blocks(config) if is_cdn_tls_server(item[0], cdn_domain)]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one active HTTPS CDN server for {cdn_domain}; found {len(matches)}")
+    return matches[0]
+
+
+def nginx_config_sections(dump: str) -> list[tuple[str, str]]:
+    markers = list(re.finditer(r"(?m)^# configuration file (.+):\s*$", dump))
+    return [
+        (marker.group(1), dump[marker.end():markers[index + 1].start() if index + 1 < len(markers) else len(dump)])
+        for index, marker in enumerate(markers)
+    ]
+
+
+def active_cdn_config(dump: str, cdn_domain: str) -> tuple[Path, str]:
+    matches: list[tuple[Path, str]] = []
+    for source, text in nginx_config_sections(dump):
+        path = Path(source)
+        for block, _, _ in nginx_server_blocks(text):
+            if is_cdn_tls_server(block, cdn_domain):
+                matches.append((path.resolve(), block))
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one loaded HTTPS CDN config for {cdn_domain}; found {len(matches)}")
+    return matches[0]
+
+
+def has_region_route_include(block: str) -> bool:
+    return re.search(
+        rf"(?m)^\s*include\s+{re.escape(NGINX_REGION_INCLUDE)}\s*;",
+        block,
+    ) is not None
+
+
+def add_region_route_include(config: str, cdn_domain: str) -> tuple[str, bool]:
+    block, start, end = cdn_server_block(config, cdn_domain)
+    if has_region_route_include(block):
+        return config, False
+    closing = end - 1
+    updated = config[:closing].rstrip() + f"\n\n    include {NGINX_REGION_INCLUDE};\n" + config[closing:]
+    return updated, True
+
+
+def ensure_region_route_include(cdn_domain: str) -> None:
+    """Repair the CDN vhost if older node setup omitted the dynamic region include."""
+    dump = subprocess.run(["nginx", "-T"], check=True, capture_output=True, text=True).stdout
+    source_path, active_block = active_cdn_config(dump, cdn_domain)
+    if has_region_route_include(active_block):
+        return
+    if not source_path.is_file():
+        raise RuntimeError("The active CDN Nginx source file is missing; refusing to guess a config path")
+    original = source_path.read_text(encoding="utf-8")
+    updated, changed = add_region_route_include(original, cdn_domain)
+    if not changed:
+        raise RuntimeError("Could not safely add the region route include to the active CDN server")
+    mode = source_path.stat().st_mode & 0o777
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=source_path.parent, delete=False) as temporary:
+            temporary.write(updated)
+            temporary_path = Path(temporary.name)
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, source_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def check_local_websocket_route(cdn_domain: str, path: str) -> None:
+    """Verify the active local CDN vhost forwards a WebSocket upgrade to its inbound."""
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {cdn_domain}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode("ascii")
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with socket.create_connection(("127.0.0.1", 443), timeout=8) as connection:
+        with context.wrap_socket(connection, server_hostname=cdn_domain) as secure:
+            secure.settimeout(8)
+            secure.sendall(request)
+            response = bytearray()
+            while b"\r\n\r\n" not in response and len(response) < 16384:
+                chunk = secure.recv(2048)
+                if not chunk:
+                    break
+                response.extend(chunk)
+    status = bytes(response).split(b"\r\n", 1)[0]
+    if not re.match(br"HTTP/1\.[01] 101(?:\s|$)", status):
+        raise RuntimeError("Local CDN WebSocket route did not return HTTP 101")
+
+
+def nginx_route_is_active(cdn_domain: str, path: str) -> bool:
+    try:
+        dump = subprocess.run(["nginx", "-T"], check=True, capture_output=True, text=True).stdout
+        _, block = active_cdn_config(dump, cdn_domain)
+        if not has_region_route_include(block):
+            return False
+        check_local_websocket_route(cdn_domain, path)
+        return True
+    except (OSError, RuntimeError, subprocess.CalledProcessError, ssl.SSLError, socket.timeout):
+        return False
 
 
 def template_has_tag(value: object, tag: str) -> bool:
@@ -260,18 +426,17 @@ def canonical_node_code(region_code: str, server_label: str, explicit: str | Non
     return f"{region_code.upper()}{suffix.group(1)}"
 
 
-def verification_state(api: Any, *, inbound_port: int, node_code: str, region_code: str, tag: str, path: str) -> dict[str, Any]:
+def verification_state(api: Any, *, inbound_port: int, node_code: str, region_code: str, tag: str, path: str, cdn_domain: str) -> dict[str, Any]:
     existing = api.request("panel/api/inbounds/list").get("obj") or []
     inbound = next((item for item in existing if int(item.get("port", 0)) == inbound_port), None)
     template = read_xray_template(api, load_core())
     runtime = api.request("panel/api/server/getConfigJson").get("obj") or {}
-    route_file = Path("/etc/nginx/bds-region-routes.d") / f"{region_code.lower()}.conf"
     expected_remark = f"{node_code} - VLESS WS CDN"
     route_state = xray_route_state(template, runtime, tag)
     return {
         "inbound": bool(inbound and inbound.get("remark") == expected_remark),
         **route_state,
-        "nginx": route_file.exists() and f"location = {path}" in route_file.read_text(encoding="utf-8"),
+        "nginx": nginx_route_is_active(cdn_domain, path),
     }
 
 
@@ -297,13 +462,13 @@ def main() -> int:
     api.login()
     tag = region_tag(args.region_code)
     if args.verify_only:
-        state = verification_state(api, inbound_port=args.inbound_port, node_code=node_code, region_code=args.region_code, tag=tag, path=args.path)
+        state = verification_state(api, inbound_port=args.inbound_port, node_code=node_code, region_code=args.region_code, tag=tag, path=args.path, cdn_domain=args.cdn_domain)
         if not all(state.values()):
             raise RuntimeError("Region verification failed: " + ", ".join(key for key, value in state.items() if not value))
         check_proxy_tunnel(args.proxy_protocol, args.proxy_host, args.proxy_port, args.proxy_user, args.proxy_password, args.health_host, args.health_port)
         state["proxy"] = True
         result = {"status": "verified", "nodeCode": node_code, "inboundPort": args.inbound_port, "checks": state}
-        print(json.dumps(result, separators=(",", ":")) if args.json else f"Verified {node_code}: inbound, routing, and Nginx route are active.")
+        print(json.dumps(result, separators=(",", ":")) if args.json else f"Verified {node_code}: inbound, routing, proxy tunnel, and live Nginx WebSocket route are active.")
         return 0
     existing = api.request("panel/api/inbounds/list").get("obj") or []
     current = next((item for item in existing if int(item.get("port", 0)) == args.inbound_port), None)
@@ -352,9 +517,10 @@ def main() -> int:
     route_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     route_file = route_dir / f"{args.region_code.lower()}.conf"
     route_file.write_text(nginx_location(args.path, args.inbound_port), encoding="utf-8")
+    ensure_region_route_include(args.cdn_domain)
     subprocess.run(["nginx", "-t"], check=True)
     subprocess.run(["systemctl", "reload", "nginx"], check=True)
-    state = verification_state(api, inbound_port=args.inbound_port, node_code=node_code, region_code=args.region_code, tag=tag, path=args.path)
+    state = verification_state(api, inbound_port=args.inbound_port, node_code=node_code, region_code=args.region_code, tag=tag, path=args.path, cdn_domain=args.cdn_domain)
     if not all(state.values()):
         failed_checks = ", ".join(key for key, value in state.items() if not value)
         raise RuntimeError(f"Post-apply region verification failed: {failed_checks}")
