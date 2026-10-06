@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add or update one CDN VLESS inbound routed through a regional SOCKS5 proxy."""
+"""Add or update one CDN VLESS inbound routed through a regional proxy."""
 from __future__ import annotations
 import argparse
 import importlib.util
@@ -31,6 +31,30 @@ def load_core():
 
 def region_tag(code: str) -> str:
     return f"BDS-REGION-{code.upper()}"
+
+
+def read_xray_template(api: Any, core: Any) -> dict[str, Any]:
+    result = api.request("panel/api/xray/", "POST").get("obj") or {}
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected Xray template response from 3x-UI")
+    template = core.json_field(result.get("xraySetting"), {})
+    if not template:
+        raise RuntimeError("3x-UI returned an empty or invalid Xray template")
+    return template
+
+
+def save_xray_template(api: Any, template: dict[str, Any]) -> None:
+    # 3x-UI persists Xray templates through this dedicated form endpoint;
+    # setting/update may return success without storing xrayTemplateConfig.
+    api.request(
+        "panel/api/xray/update",
+        "POST",
+        form={"xraySetting": json.dumps(template, separators=(",", ":"))},
+    )
+
+
+def restart_xray(api: Any) -> None:
+    api.request("panel/api/server/restartXrayService", "POST")
 
 
 def update_template(template: dict[str, Any], *, tag: str, inbound_port: int, proxy_protocol: str = "socks5", proxy_host: str, proxy_port: int, proxy_user: str, proxy_password: str) -> dict[str, Any]:
@@ -70,6 +94,18 @@ def template_has_tag(value: object, tag: str) -> bool:
         isinstance(item, dict) and item.get("outboundTag") == tag
         for item in (value.get("routing") or {}).get("rules", [])
     )
+
+
+def xray_route_state(template: dict[str, Any], runtime: object, tag: str) -> dict[str, bool]:
+    template_rules = (template.get("routing") or {}).get("rules", [])
+    runtime_outbounds = runtime.get("outbounds", []) if isinstance(runtime, dict) else []
+    runtime_rules = (runtime.get("routing") or {}).get("rules", []) if isinstance(runtime, dict) else []
+    return {
+        "outbound": any(isinstance(item, dict) and item.get("tag") == tag for item in template.get("outbounds", []))
+        and any(isinstance(item, dict) and item.get("tag") == tag for item in runtime_outbounds),
+        "routing": any(isinstance(item, dict) and item.get("outboundTag") == tag for item in template_rules)
+        and any(isinstance(item, dict) and item.get("outboundTag") == tag for item in runtime_rules),
+    }
 
 
 def check_proxy_tunnel(protocol: str, proxy_host: str, proxy_port: int, proxy_user: str, proxy_password: str, target_host: str, target_port: int, timeout: float = 8.0) -> None:
@@ -134,7 +170,7 @@ def check_proxy_tunnel(protocol: str, proxy_host: str, proxy_port: int, proxy_us
 def enable_read_request_retries(api: Any, *, sleep_fn=time.sleep, max_attempts: int = 6) -> None:
     """Retry transient connection refusals for idempotent 3x-UI reads only."""
     original_request = api.request
-    read_only_post_paths = {"panel/api/setting/all"}
+    read_only_post_paths = {"panel/api/setting/all", "panel/api/xray/"}
 
     def request(path: str, method: str = "GET", payload: Any = None, form: dict[str, str] | None = None) -> dict[str, Any]:
         retryable = method.upper() == "GET" or (method.upper() == "POST" and path.lstrip("/") in read_only_post_paths)
@@ -154,15 +190,6 @@ def enable_read_request_retries(api: Any, *, sleep_fn=time.sleep, max_attempts: 
         raise RuntimeError("3x-UI read retry loop ended unexpectedly")
 
     api.request = request
-
-
-def persist_postgres_template(dsn: str, template: dict[str, Any]) -> None:
-    serialized = json.dumps(template, separators=(",", ":"))
-    delimiter = "$bds_region$"
-    if delimiter in serialized:
-        raise RuntimeError("Unexpected PostgreSQL delimiter in Xray template")
-    sql = f"UPDATE settings SET value={delimiter}{serialized}{delimiter} WHERE key='xrayTemplateConfig';\n"
-    subprocess.run(["psql", dsn, "-v", "ON_ERROR_STOP=1"], input=sql, text=True, check=True, stdout=subprocess.DEVNULL)
 
 
 def parse_args() -> argparse.Namespace:
@@ -208,15 +235,14 @@ def canonical_node_code(region_code: str, server_label: str, explicit: str | Non
 def verification_state(api: Any, *, inbound_port: int, node_code: str, region_code: str, tag: str, path: str) -> dict[str, Any]:
     existing = api.request("panel/api/inbounds/list").get("obj") or []
     inbound = next((item for item in existing if int(item.get("port", 0)) == inbound_port), None)
-    settings = api.request("panel/api/setting/all", "POST").get("obj") or {}
-    template = load_core().json_field(settings.get("xrayTemplateConfig"), {})
+    template = read_xray_template(api, load_core())
+    runtime = api.request("panel/api/server/getConfigJson").get("obj") or {}
     route_file = Path("/etc/nginx/bds-region-routes.d") / f"{region_code.lower()}.conf"
     expected_remark = f"{node_code} - VLESS WS CDN"
-    rules = (template.get("routing") or {}).get("rules", []) if isinstance(template, dict) else []
+    route_state = xray_route_state(template, runtime, tag)
     return {
         "inbound": bool(inbound and inbound.get("remark") == expected_remark),
-        "outbound": any(isinstance(item, dict) and item.get("tag") == tag for item in template.get("outbounds", [])) if isinstance(template, dict) else False,
-        "routing": any(isinstance(item, dict) and item.get("outboundTag") == tag for item in rules),
+        **route_state,
         "nginx": route_file.exists() and f"location = {path}" in route_file.read_text(encoding="utf-8"),
     }
 
@@ -264,7 +290,7 @@ def main() -> int:
     if not isinstance(clients, list) or not clients:
         raise RuntimeError("Source inbound has no clients to attach")
     settings = api.request("panel/api/setting/all", "POST").get("obj") or {}
-    template = core.json_field(settings.get("xrayTemplateConfig"), {})
+    template = read_xray_template(api, core)
     update_template(template, tag=tag, inbound_port=args.inbound_port, proxy_protocol=args.proxy_protocol, proxy_host=args.proxy_host, proxy_port=args.proxy_port, proxy_user=args.proxy_user, proxy_password=args.proxy_password)
     check_proxy_tunnel(args.proxy_protocol, args.proxy_host, args.proxy_port, args.proxy_user, args.proxy_password, args.health_host, args.health_port)
     if args.dry_run:
@@ -289,29 +315,17 @@ def main() -> int:
     })
     settings["xrayTemplateConfig"] = json.dumps(template, separators=(",", ":"))
     api.request("panel/api/setting/update", "POST", settings)
+    save_xray_template(api, template)
     refreshed = api.request("panel/api/inbounds/list").get("obj") or []
     spec = {**payload, "streamSettings": stream}
     core.configure_hosts(api, refreshed, [spec])
+    restart_xray(api)
     route_dir = Path("/etc/nginx/bds-region-routes.d")
     route_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     route_file = route_dir / f"{args.region_code.lower()}.conf"
     route_file.write_text(nginx_location(args.path, args.inbound_port), encoding="utf-8")
     subprocess.run(["nginx", "-t"], check=True)
     subprocess.run(["systemctl", "reload", "nginx"], check=True)
-    persisted = api.request("panel/api/setting/all", "POST").get("obj") or {}
-    persisted_template = core.json_field(persisted.get("xrayTemplateConfig"), {})
-    if not template_has_tag(persisted_template, tag):
-        dsn = os.environ.get("XUI_DB_DSN", "")
-        if not dsn:
-            raise RuntimeError("3x-UI did not persist xrayTemplateConfig and XUI_DB_DSN is unavailable for the PostgreSQL fallback")
-        persist_postgres_template(dsn, template)
-        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
-        for _ in range(30):
-            if subprocess.run(["systemctl", "is-active", "--quiet", "x-ui"]).returncode == 0:
-                break
-            time.sleep(1)
-        else:
-            raise RuntimeError("x-ui did not become active after the Xray template update")
     state = verification_state(api, inbound_port=args.inbound_port, node_code=node_code, region_code=args.region_code, tag=tag, path=args.path)
     if not all(state.values()):
         failed_checks = ", ".join(key for key, value in state.items() if not value)

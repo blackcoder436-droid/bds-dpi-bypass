@@ -14,6 +14,35 @@ spec.loader.exec_module(region)
 
 
 class RegionProxyTests(unittest.TestCase):
+    def test_template_is_read_and_saved_via_xray_settings_api(self) -> None:
+        template = {"outbounds": [{"tag": "direct"}], "routing": {"rules": []}}
+
+        class FakeApi:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, path, method="GET", payload=None, form=None):
+                self.calls.append((path, method, payload, form))
+                if path == "panel/api/xray/":
+                    import json
+                    return {"obj": {"xraySetting": json.dumps(template)}}
+                return {"success": True}
+
+        class FakeCore:
+            @staticmethod
+            def json_field(value, fallback):
+                import json
+                return json.loads(value) if isinstance(value, str) else value
+
+        api = FakeApi()
+        self.assertEqual(region.read_xray_template(api, FakeCore), template)
+        region.save_xray_template(api, template)
+        self.assertEqual(api.calls[0][:3], ("panel/api/xray/", "POST", None))
+        self.assertEqual(api.calls[1][:3], ("panel/api/xray/update", "POST", None))
+        self.assertEqual(api.calls[1][3]["xraySetting"], '{"outbounds":[{"tag":"direct"}],"routing":{"rules":[]}}')
+        region.restart_xray(api)
+        self.assertEqual(api.calls[2][:3], ("panel/api/server/restartXrayService", "POST", None))
+
     def test_template_update_is_idempotent_and_scoped(self) -> None:
         template = {"outbounds": [{"tag": "WARP", "protocol": "wireguard"}], "routing": {"rules": [{"type": "field", "inboundTag": ["in-10001-tcp"], "outboundTag": "WARP"}]}}
         kwargs = dict(tag="BDS-REGION-JP", inbound_port=10006, proxy_host="proxy.example", proxy_port=1080, proxy_user="user", proxy_password="secret")
@@ -34,6 +63,14 @@ class RegionProxyTests(unittest.TestCase):
         self.assertFalse(region.template_has_tag(template, "BDS-REGION-TH"))
         template["routing"]["rules"].append({"outboundTag": "BDS-REGION-TH"})
         self.assertTrue(region.template_has_tag(template, "BDS-REGION-TH"))
+
+    def test_runtime_outbound_and_routing_must_match_saved_template(self) -> None:
+        tag = "BDS-REGION-US"
+        template = {"outbounds": [{"tag": tag}], "routing": {"rules": [{"outboundTag": tag}]}}
+        runtime = {"outbounds": [{"tag": tag}], "routing": {"rules": []}}
+        self.assertEqual(region.xray_route_state(template, runtime, tag), {"outbound": True, "routing": False})
+        runtime["routing"]["rules"].append({"outboundTag": tag})
+        self.assertEqual(region.xray_route_state(template, runtime, tag), {"outbound": True, "routing": True})
 
     def test_canonical_node_code_uses_panel_suffix(self) -> None:
         self.assertEqual(region.canonical_node_code("jp", "SG1"), "JP1")
@@ -57,6 +94,24 @@ class RegionProxyTests(unittest.TestCase):
         waits = []
         region.enable_read_request_retries(api, sleep_fn=waits.append)
         self.assertEqual(api.request("panel/api/inbounds/list"), {"success": True})
+        self.assertEqual(api.calls, 2)
+        self.assertEqual(waits, [0.5])
+
+    def test_xray_template_read_is_safe_to_retry(self) -> None:
+        class FakeApi:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, path, method="GET", payload=None, form=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(f"3x-UI request failed on {path}: [Errno 111] Connection refused")
+                return {"success": True}
+
+        api = FakeApi()
+        waits = []
+        region.enable_read_request_retries(api, sleep_fn=waits.append)
+        self.assertEqual(api.request("panel/api/xray/", "POST"), {"success": True})
         self.assertEqual(api.calls, 2)
         self.assertEqual(waits, [0.5])
 
