@@ -33,13 +33,41 @@ def region_tag(code: str) -> str:
     return f"BDS-REGION-{code.upper()}"
 
 
+def parse_xray_template(value: Any) -> dict[str, Any]:
+    config_keys = {"inbounds", "outbounds", "routing", "log", "api", "dns", "policy", "stats"}
+    for _ in range(8):
+        if isinstance(value, dict):
+            if config_keys.intersection(value):
+                return value
+            nested = value.get("xraySetting", value.get("xrayTemplateConfig"))
+            if nested is None:
+                return {}
+            value = nested
+            continue
+        if isinstance(value, str) and value.strip():
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            continue
+        return {}
+    return {}
+
+
 def read_xray_template(api: Any, core: Any) -> dict[str, Any]:
+    # Prefer the panel's Xray-specific reader, but retain setting/all for
+    # older builds and normalize legacy response-shaped JSON wrappers.
+    try:
+        result = api.request("panel/api/xray/", "POST").get("obj") or {}
+        template = parse_xray_template(result.get("xraySetting") if isinstance(result, dict) and "xraySetting" in result else result)
+        if template:
+            return template
+    except RuntimeError:
+        pass
     settings = api.request("panel/api/setting/all", "POST").get("obj") or {}
-    if not isinstance(settings, dict):
-        raise RuntimeError("Unexpected settings response from 3x-UI")
-    template = core.json_field(settings.get("xrayTemplateConfig"), {})
+    template = parse_xray_template(settings.get("xrayTemplateConfig") if isinstance(settings, dict) else None)
     if not template:
-        raise RuntimeError("3x-UI returned an empty or invalid Xray template")
+        raise RuntimeError("3x-UI did not return a usable Xray template")
     return template
 
 
@@ -170,7 +198,7 @@ def check_proxy_tunnel(protocol: str, proxy_host: str, proxy_port: int, proxy_us
 def enable_read_request_retries(api: Any, *, sleep_fn=time.sleep, max_attempts: int = 6) -> None:
     """Retry transient connection refusals for idempotent 3x-UI reads only."""
     original_request = api.request
-    read_only_post_paths = {"panel/api/setting/all"}
+    read_only_post_paths = {"panel/api/setting/all", "panel/api/xray/"}
 
     def request(path: str, method: str = "GET", payload: Any = None, form: dict[str, str] | None = None) -> dict[str, Any]:
         retryable = method.upper() == "GET" or (method.upper() == "POST" and path.lstrip("/") in read_only_post_paths)

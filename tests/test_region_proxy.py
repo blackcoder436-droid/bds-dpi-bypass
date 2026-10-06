@@ -15,7 +15,7 @@ spec.loader.exec_module(region)
 
 
 class RegionProxyTests(unittest.TestCase):
-    def test_template_uses_compatible_read_and_dedicated_xray_save_apis(self) -> None:
+    def test_template_prefers_xray_read_and_dedicated_save_apis(self) -> None:
         template = {"outbounds": [{"tag": "direct"}], "routing": {"rules": []}}
 
         class FakeApi:
@@ -24,6 +24,8 @@ class RegionProxyTests(unittest.TestCase):
 
             def request(self, path, method="GET", payload=None, form=None):
                 self.calls.append((path, method, payload, form))
+                if path == "panel/api/xray/":
+                    return {"obj": {"xraySetting": json.dumps(template)}}
                 if path == "panel/api/setting/all":
                     return {"obj": {"xrayTemplateConfig": json.dumps(template)}}
                 return {"success": True}
@@ -36,11 +38,42 @@ class RegionProxyTests(unittest.TestCase):
         api = FakeApi()
         self.assertEqual(region.read_xray_template(api, FakeCore), template)
         region.save_xray_template(api, template)
-        self.assertEqual(api.calls[0][:3], ("panel/api/setting/all", "POST", None))
+        self.assertEqual(api.calls[0][:3], ("panel/api/xray/", "POST", None))
         self.assertEqual(api.calls[1][:3], ("panel/api/xray/update", "POST", None))
         self.assertEqual(api.calls[1][3]["xraySetting"], '{"outbounds":[{"tag":"direct"}],"routing":{"rules":[]}}')
         region.restart_xray(api)
         self.assertEqual(api.calls[2][:3], ("panel/api/server/restartXrayService", "POST", None))
+
+    def test_template_reader_unwraps_legacy_nested_xray_setting(self) -> None:
+        template = {"outbounds": [{"tag": "direct"}], "routing": {"rules": []}}
+        wrapped = {"inboundTags": ["in-443-tcp"], "outboundTestUrl": "https://example.test/", "xraySetting": template}
+
+        class FakeApi:
+            def request(self, path, method="GET", payload=None, form=None):
+                if path == "panel/api/xray/":
+                    return {"obj": {"xraySetting": json.dumps(wrapped)}}
+                raise AssertionError(f"Unexpected fallback request: {path}")
+
+        self.assertEqual(region.read_xray_template(FakeApi(), object()), template)
+
+    def test_template_reader_falls_back_to_legacy_settings_endpoint(self) -> None:
+        template = {"outbounds": [{"tag": "direct"}], "routing": {"rules": []}}
+
+        class FakeApi:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, path, method="GET", payload=None, form=None):
+                self.calls.append(path)
+                if path == "panel/api/xray/":
+                    return {"obj": {"xraySetting": "not-json"}}
+                if path == "panel/api/setting/all":
+                    return {"obj": {"xrayTemplateConfig": json.dumps(template)}}
+                raise AssertionError(f"Unexpected request: {path}")
+
+        api = FakeApi()
+        self.assertEqual(region.read_xray_template(api, object()), template)
+        self.assertEqual(api.calls, ["panel/api/xray/", "panel/api/setting/all"])
 
     def test_template_update_is_idempotent_and_scoped(self) -> None:
         template = {"outbounds": [{"tag": "WARP", "protocol": "wireguard"}], "routing": {"rules": [{"type": "field", "inboundTag": ["in-10001-tcp"], "outboundTag": "WARP"}]}}
@@ -111,6 +144,24 @@ class RegionProxyTests(unittest.TestCase):
         waits = []
         region.enable_read_request_retries(api, sleep_fn=waits.append)
         self.assertEqual(api.request("panel/api/setting/all", "POST"), {"success": True})
+        self.assertEqual(api.calls, 2)
+        self.assertEqual(waits, [0.5])
+
+    def test_xray_template_endpoint_read_is_safe_to_retry(self) -> None:
+        class FakeApi:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, path, method="GET", payload=None, form=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(f"3x-UI request failed on {path}: [Errno 111] Connection refused")
+                return {"success": True}
+
+        api = FakeApi()
+        waits = []
+        region.enable_read_request_retries(api, sleep_fn=waits.append)
+        self.assertEqual(api.request("panel/api/xray/", "POST"), {"success": True})
         self.assertEqual(api.calls, 2)
         self.assertEqual(waits, [0.5])
 
