@@ -42,6 +42,39 @@ class RegionProxyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             region.canonical_node_code("jp", "Singapore")
 
+    def test_read_requests_retry_transient_connection_refusals(self) -> None:
+        class FakeApi:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, path, method="GET", payload=None, form=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(f"3x-UI request failed on {path}: [Errno 111] Connection refused")
+                return {"success": True}
+
+        api = FakeApi()
+        waits = []
+        region.enable_read_request_retries(api, sleep_fn=waits.append)
+        self.assertEqual(api.request("panel/api/inbounds/list"), {"success": True})
+        self.assertEqual(api.calls, 2)
+        self.assertEqual(waits, [0.5])
+
+    def test_mutating_requests_are_not_retried(self) -> None:
+        class FakeApi:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, path, method="GET", payload=None, form=None):
+                self.calls += 1
+                raise RuntimeError(f"3x-UI request failed on {path}: [Errno 111] Connection refused")
+
+        api = FakeApi()
+        region.enable_read_request_retries(api, sleep_fn=lambda _: self.fail("mutating request must not retry"))
+        with self.assertRaisesRegex(RuntimeError, "Connection refused"):
+            api.request("panel/api/inbounds/add", "POST", {"remark": "new"})
+        self.assertEqual(api.calls, 1)
+
     def test_http_proxy_maps_to_xray_http_outbound(self) -> None:
         template = {"outbounds": [], "routing": {"rules": []}}
         region.update_template(template, tag="BDS-REGION-JP1", inbound_port=10006, proxy_protocol="http", proxy_host="proxy.example", proxy_port=8080, proxy_user="user", proxy_password="secret")

@@ -131,6 +131,31 @@ def check_proxy_tunnel(protocol: str, proxy_host: str, proxy_port: int, proxy_us
             raise RuntimeError("SOCKS5 proxy returned an invalid address type")
 
 
+def enable_read_request_retries(api: Any, *, sleep_fn=time.sleep, max_attempts: int = 6) -> None:
+    """Retry transient connection refusals for idempotent 3x-UI reads only."""
+    original_request = api.request
+    read_only_post_paths = {"panel/api/setting/all"}
+
+    def request(path: str, method: str = "GET", payload: Any = None, form: dict[str, str] | None = None) -> dict[str, Any]:
+        retryable = method.upper() == "GET" or (method.upper() == "POST" and path.lstrip("/") in read_only_post_paths)
+        for attempt in range(max_attempts if retryable else 1):
+            try:
+                return original_request(path, method, payload, form)
+            except RuntimeError as exc:
+                transient_refusal = re.search(
+                    r"3x-UI request failed on [A-Za-z0-9_/-]+:.*(?:Connection refused|ECONNREFUSED|Errno 111)",
+                    str(exc),
+                    re.IGNORECASE,
+                )
+                if not retryable or not transient_refusal or attempt + 1 >= max_attempts:
+                    raise
+                sleep_fn(min(0.5 * (2**attempt), 4.0))
+
+        raise RuntimeError("3x-UI read retry loop ended unexpectedly")
+
+    api.request = request
+
+
 def persist_postgres_template(dsn: str, template: dict[str, Any]) -> None:
     serialized = json.dumps(template, separators=(",", ":"))
     delimiter = "$bds_region$"
@@ -212,6 +237,7 @@ def main() -> int:
         raise RuntimeError("REGION_PROXY_USER and REGION_PROXY_PASSWORD must be provided together")
     core = load_core()
     api = core.ApiClient(args.panel_url, args.username, args.password)
+    enable_read_request_retries(api)
     api.login()
     tag = region_tag(args.region_code)
     if args.verify_only:
