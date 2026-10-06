@@ -212,9 +212,11 @@ def verification_state(api: Any, *, inbound_port: int, node_code: str, region_co
     template = load_core().json_field(settings.get("xrayTemplateConfig"), {})
     route_file = Path("/etc/nginx/bds-region-routes.d") / f"{region_code.lower()}.conf"
     expected_remark = f"{node_code} - VLESS WS CDN"
+    rules = (template.get("routing") or {}).get("rules", []) if isinstance(template, dict) else []
     return {
         "inbound": bool(inbound and inbound.get("remark") == expected_remark),
-        "routing": template_has_tag(template, tag),
+        "outbound": any(isinstance(item, dict) and item.get("tag") == tag for item in template.get("outbounds", [])) if isinstance(template, dict) else False,
+        "routing": any(isinstance(item, dict) and item.get("outboundTag") == tag for item in rules),
         "nginx": route_file.exists() and f"location = {path}" in route_file.read_text(encoding="utf-8"),
     }
 
