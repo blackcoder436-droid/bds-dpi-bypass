@@ -1,5 +1,6 @@
 from __future__ import annotations
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -14,7 +15,7 @@ spec.loader.exec_module(region)
 
 
 class RegionProxyTests(unittest.TestCase):
-    def test_template_is_read_and_saved_via_xray_settings_api(self) -> None:
+    def test_template_uses_compatible_read_and_dedicated_xray_save_apis(self) -> None:
         template = {"outbounds": [{"tag": "direct"}], "routing": {"rules": []}}
 
         class FakeApi:
@@ -23,21 +24,19 @@ class RegionProxyTests(unittest.TestCase):
 
             def request(self, path, method="GET", payload=None, form=None):
                 self.calls.append((path, method, payload, form))
-                if path == "panel/api/xray/":
-                    import json
-                    return {"obj": {"xraySetting": json.dumps(template)}}
+                if path == "panel/api/setting/all":
+                    return {"obj": {"xrayTemplateConfig": json.dumps(template)}}
                 return {"success": True}
 
         class FakeCore:
             @staticmethod
             def json_field(value, fallback):
-                import json
                 return json.loads(value) if isinstance(value, str) else value
 
         api = FakeApi()
         self.assertEqual(region.read_xray_template(api, FakeCore), template)
         region.save_xray_template(api, template)
-        self.assertEqual(api.calls[0][:3], ("panel/api/xray/", "POST", None))
+        self.assertEqual(api.calls[0][:3], ("panel/api/setting/all", "POST", None))
         self.assertEqual(api.calls[1][:3], ("panel/api/xray/update", "POST", None))
         self.assertEqual(api.calls[1][3]["xraySetting"], '{"outbounds":[{"tag":"direct"}],"routing":{"rules":[]}}')
         region.restart_xray(api)
@@ -97,7 +96,7 @@ class RegionProxyTests(unittest.TestCase):
         self.assertEqual(api.calls, 2)
         self.assertEqual(waits, [0.5])
 
-    def test_xray_template_read_is_safe_to_retry(self) -> None:
+    def test_xray_template_settings_read_is_safe_to_retry(self) -> None:
         class FakeApi:
             def __init__(self):
                 self.calls = 0
@@ -111,7 +110,7 @@ class RegionProxyTests(unittest.TestCase):
         api = FakeApi()
         waits = []
         region.enable_read_request_retries(api, sleep_fn=waits.append)
-        self.assertEqual(api.request("panel/api/xray/", "POST"), {"success": True})
+        self.assertEqual(api.request("panel/api/setting/all", "POST"), {"success": True})
         self.assertEqual(api.calls, 2)
         self.assertEqual(waits, [0.5])
 

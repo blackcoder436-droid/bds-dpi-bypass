@@ -34,10 +34,10 @@ def region_tag(code: str) -> str:
 
 
 def read_xray_template(api: Any, core: Any) -> dict[str, Any]:
-    result = api.request("panel/api/xray/", "POST").get("obj") or {}
-    if not isinstance(result, dict):
-        raise RuntimeError("Unexpected Xray template response from 3x-UI")
-    template = core.json_field(result.get("xraySetting"), {})
+    settings = api.request("panel/api/setting/all", "POST").get("obj") or {}
+    if not isinstance(settings, dict):
+        raise RuntimeError("Unexpected settings response from 3x-UI")
+    template = core.json_field(settings.get("xrayTemplateConfig"), {})
     if not template:
         raise RuntimeError("3x-UI returned an empty or invalid Xray template")
     return template
@@ -170,7 +170,7 @@ def check_proxy_tunnel(protocol: str, proxy_host: str, proxy_port: int, proxy_us
 def enable_read_request_retries(api: Any, *, sleep_fn=time.sleep, max_attempts: int = 6) -> None:
     """Retry transient connection refusals for idempotent 3x-UI reads only."""
     original_request = api.request
-    read_only_post_paths = {"panel/api/setting/all", "panel/api/xray/"}
+    read_only_post_paths = {"panel/api/setting/all"}
 
     def request(path: str, method: str = "GET", payload: Any = None, form: dict[str, str] | None = None) -> dict[str, Any]:
         retryable = method.upper() == "GET" or (method.upper() == "POST" and path.lstrip("/") in read_only_post_paths)
